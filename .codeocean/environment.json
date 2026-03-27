@@ -1,0 +1,40 @@
+{
+	"version": 1,
+	"base_image": "codeocean/code-server-python-extensions-pack:v5.0",
+	"options": {
+		"registry_host_arg": true,
+		"git_ask_pass": true,
+		"mount_secrets": true
+	},
+	"installers": {
+		"pip": {
+			"packages": [
+				{
+					"name": "aind-data-access-api[docdb]",
+					"version": "1.9.4"
+				},
+				{
+					"name": "codeocean",
+					"version": "0.14.0"
+				},
+				{
+					"name": "git+https://github.com/AllenNeuralDynamics/aind-hcr-data-loader.git#egg=aind-hcr-data-loader",
+					"version": "1cd089defc6c3cc13bd7fff1f39126311789f948"
+				},
+				{
+					"name": "git+https://github.com/AllenNeuralDynamics/aind-hcr-qc.git#egg=aind-hcr-qc",
+					"version": "41159afcd230fef79777dfadcf5b6dabeb97471d"
+				}
+			],
+			"options": {},
+			"pre_install_options": {}
+		},
+		"vscode": {
+			"packages": [
+				{
+					"name": "anthropic.claude-code"
+				}
+			]
+		}
+	}
+}
