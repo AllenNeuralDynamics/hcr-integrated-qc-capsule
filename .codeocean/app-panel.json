@@ -1,0 +1,14 @@
+{
+	"version": 1,
+	"named_parameters": true,
+	"parameters": [
+		{
+			"id": "GYXABnWDQzvAjIlz",
+			"name": "mouse-id",
+			"param_name": "mouse-id",
+			"type": "text",
+			"value_type": "string",
+			"required": true
+		}
+	]
+}

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -e
+# cd /src && git clone https://github.com/AllenNeuralDynamics/ophys-mfish-dataset-catalog
+# pwd
+#cd ophys-mfish-dev
+#pip install --no-cache-dir -e .

@@ -1,4 +1,4 @@
-# hash:sha256:5ab89bd73ee5a09e148ef32286fc28986be5cd04c55802004b38c501892bfc1f
+# hash:sha256:cc46ad8278842dec6385ef98a290ea71ab0bf735265fc45cb93105abf318f630
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/code-server-python-extensions-pack:v5.0
 
@@ -11,7 +11,13 @@ RUN --mount=type=secret,id=git-access-token \
     pip install -U --no-cache-dir \
     aind-data-access-api[docdb]==1.9.4 \
     codeocean==0.14.0 \
-    -e git+https://github.com/AllenNeuralDynamics/aind-hcr-data-loader.git@1cd089defc6c3cc13bd7fff1f39126311789f948#egg=aind-hcr-data-loader \
-    -e git+https://github.com/AllenNeuralDynamics/aind-hcr-qc.git@41159afcd230fef79777dfadcf5b6dabeb97471d#egg=aind-hcr-qc
+    numpy==2.4.3 \
+    -e git+https://github.com/AllenNeuralDynamics/aind-hcr-data-loader.git@732acd222348aa0d0f0012fa37e1d3c8c5e56d71#egg=aind-hcr-data-loader \
+    -e git+https://github.com/AllenNeuralDynamics/aind-hcr-qc.git@87695f473038cb8c996936c2a44ee400f0a5a305#egg=aind-hcr-qc \
+    -e git+https://github.com/AllenNeuralDynamics/ophys-mfish-dataset-catalog.git@13e39676959559eebdeaf68b440254996e34692e#egg=ophys-mfish-dataset-catalog
 
 RUN code-server --extensions-dir="/.vscode/extensions" --install-extension anthropic.claude-code
+
+COPY postInstall /
+RUN --mount=type=secret,id=secrets . /run/secrets/secrets \
+    && /postInstall
