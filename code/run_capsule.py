@@ -1,4 +1,10 @@
-"""top level run script"""
+"""top level run script
+
+Example usage:
+    python run_capsule.py --mouse-id 755252
+    python run_capsule.py --mouse-id 755252 --overwrite
+    python run_capsule.py --mouse-id 755252 --bucket my-bucket --overwrite
+"""
 
 import argparse
 import matplotlib.pyplot as plt
