@@ -24,7 +24,7 @@
 				},
 				{
 					"name": "git+https://github.com/AllenNeuralDynamics/aind-hcr-qc.git#egg=aind-hcr-qc",
-					"version": "87695f473038cb8c996936c2a44ee400f0a5a305"
+					"version": "19bbc9fe7c026b265070c2309249e3b06406e8ff"
 				},
 				{
 					"name": "git+https://github.com/AllenNeuralDynamics/ophys-mfish-dataset-catalog.git#egg=ophys-mfish-dataset-catalog",
