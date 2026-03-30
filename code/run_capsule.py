@@ -18,6 +18,7 @@ from aind_hcr_data_loader.codeocean_utils import (
 from aind_hcr_data_loader.hcr_dataset import create_hcr_dataset_from_schema
 from aind_hcr_data_loader.pairwise_dataset import create_pairwise_unmixing_dataset
 from aind_hcr_qc.viz.intergrated_datasets import plot_intensity_violins
+from aind_hcr_qc.viz.spectral_unmixing import plot_channel_intensity_histograms_by_round
 import aind_hcr_qc.viz.cell_x_gene
 from aind_hcr_qc.utils.s3_qc import QC_S3_BUCKET, check_plot_exists, upload_plot
 
@@ -94,9 +95,9 @@ def _upload_and_close(fig, bucket, mouse_id, plot_type, plot_kwargs, source_asse
 # Category runners
 # ---------------------------------------------------------------------------
 
-def run_spots_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite):
+def run_spots_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, spot_specs=None):
     """Spots intensity violin plots."""
-    plots_to_run = _filter_plots_by_s3(SPOTS_PLOTS, bucket, mouse_id, overwrite)
+    plots_to_run = _filter_plots_by_s3(spot_specs or SPOTS_PLOTS, bucket, mouse_id, overwrite)
     if not plots_to_run:
         return
 
@@ -109,24 +110,32 @@ def run_spots_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite):
         )
 
     for spec in plots_to_run:
-        plot_intensity_violins(
-            spots_df,
-            **spec["plot_kwargs"],
-            save=False,
-            show=True,
-            close=False,
-        )
+        if spec["plot_type"] == "spots_intensity_hist_log":
+            fig = plot_channel_intensity_histograms_by_round(
+                spots_df,
+                **spec["plot_kwargs"],
+                title_prefix=f"{mouse_id} - ",
+            )
+        else:
+            plot_intensity_violins(
+                spots_df,
+                **spec["plot_kwargs"],
+                save=False,
+                show=True,
+                close=False,
+            )
+            fig = plt.gcf()
         _upload_and_close(
-            plt.gcf(), bucket, mouse_id,
+            fig, bucket, mouse_id,
             spec["plot_type"], spec["plot_kwargs"], source_assets,
         )
 
     del spots_df
 
 
-def run_taxonomy_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite):
+def run_taxonomy_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, taxonomy_specs=None):
     """Taxonomy centroid scatter plots."""
-    plots_to_run = _filter_plots_by_s3(TAXONOMY_PLOTS, bucket, mouse_id, overwrite)
+    plots_to_run = _filter_plots_by_s3(taxonomy_specs or TAXONOMY_PLOTS, bucket, mouse_id, overwrite)
     if not plots_to_run:
         return
 
@@ -165,19 +174,39 @@ def run_plots(
     source_assets: dict | None = None,
     bucket: str = QC_S3_BUCKET,
     overwrite: bool = False,
+    plot_types: list[str] | None = None,
 ) -> None:
     """Generate all QC plots and upload each to S3 with a JSON sidecar."""
     if pw_dataset is None:
         print("No pairwise dataset — skipping plots.")
         return
 
-    run_spots_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite)
-    run_taxonomy_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite)
+    if plot_types:
+        allowed = set(plot_types)
+        spot_specs = [s for s in SPOTS_PLOTS if s["plot_type"] in allowed]
+        taxonomy_specs = [s for s in TAXONOMY_PLOTS if s["plot_type"] in allowed]
+    else:
+        spot_specs = SPOTS_PLOTS
+        taxonomy_specs = TAXONOMY_PLOTS
+
+    run_spots_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, spot_specs)
+    run_taxonomy_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, taxonomy_specs)
 
 
-def run(mouse_id: str, bucket: str = QC_S3_BUCKET, overwrite: bool = False) -> None:
+def run(
+    mouse_id: str,
+    bucket: str = QC_S3_BUCKET,
+    overwrite: bool = False,
+    plot_types: list[str] | None = None,
+) -> None:
     dataset, pw_dataset, source_assets = load_data(mouse_id)
-    run_plots(mouse_id, pw_dataset, source_assets=source_assets, bucket=bucket, overwrite=overwrite)
+    run_plots(
+        mouse_id, pw_dataset,
+        source_assets=source_assets,
+        bucket=bucket,
+        overwrite=overwrite,
+        plot_types=plot_types,
+    )
 
 
 if __name__ == "__main__":
@@ -194,5 +223,18 @@ if __name__ == "__main__":
         default=False,
         help="Re-generate and re-upload even if the plot already exists on S3",
     )
+    parser.add_argument(
+        "--plot-type",
+        nargs="+",
+        metavar="PLOT_TYPE",
+        default=None,
+        help="One or more plot type names to run (default: all). "
+             "Example: --plot-type spots_intensity_hist_log spots_intensity_violins_alpha_order",
+    )
     args = parser.parse_args()
-    run(args.mouse_id, bucket=args.bucket, overwrite=args.overwrite)
+    run(
+        args.mouse_id,
+        bucket=args.bucket,
+        overwrite=args.overwrite,
+        plot_types=args.plot_type,
+    )

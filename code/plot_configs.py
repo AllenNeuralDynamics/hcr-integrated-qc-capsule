@@ -6,6 +6,8 @@ Every entry has:
     plot_kwargs : dict – keyword arguments forwarded to the plotting function
 """
 
+import aind_hcr_qc.constants as constants
+
 # ---------------------------------------------------------------------------
 # Spots plots  (data: pw_dataset.load_all_rounds_spots_mp)
 # ---------------------------------------------------------------------------
@@ -25,6 +27,17 @@ SPOTS_PLOTS = [
             "intensity_threshold": 25.0,
             "order": "alpha",
             "n_sample": 25_000,
+        },
+    },
+    {
+        "plot_type": "spots_intensity_hist_log",
+        "plot_kwargs": {
+            "channel_col": "unmixed_chan",
+            "round_col": "round",
+            "cmap": constants.Z1_CHANNEL_CMAP_SOFT,
+            "bins": 200,
+            "log_scale": True,
+            "xlim": (1, 4.5),
         },
     },
 ]
