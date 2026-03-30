@@ -17,12 +17,12 @@ from aind_hcr_data_loader.codeocean_utils import (
 )
 from aind_hcr_data_loader.hcr_dataset import create_hcr_dataset_from_schema
 from aind_hcr_data_loader.pairwise_dataset import create_pairwise_unmixing_dataset
-from aind_hcr_qc.viz.intergrated_datasets import plot_intensity_violins
+from aind_hcr_qc.viz.intergrated_datasets import plot_intensity_violins, plot_gene_spot_count_pairplot
 from aind_hcr_qc.viz.spectral_unmixing import plot_channel_intensity_histograms_by_round
 import aind_hcr_qc.viz.cell_x_gene
 from aind_hcr_qc.utils.s3_qc import QC_S3_BUCKET, check_plot_exists, upload_plot
 
-from plot_configs import SPOTS_PLOTS, TAXONOMY_PLOTS
+from plot_configs import SPOTS_PLOTS, TAXONOMY_PLOTS, CXG_PLOTS
 
 CATALOG_BASE = Path("/src/ophys-mfish-dataset-catalog/mice")
 DATA_DIR = Path("/root/capsule/data")
@@ -164,6 +164,28 @@ def run_taxonomy_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, t
     del cells
 
 
+def run_cxg_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, cxg_specs=None):
+    """Pairwise gene spot-count plots from the aggregated cell-by-gene table."""
+    plots_to_run = _filter_plots_by_s3(cxg_specs or CXG_PLOTS, bucket, mouse_id, overwrite)
+    if not plots_to_run:
+        return
+
+    cxg_wide = pw_dataset.load_aggregated_cxg(unmixed=True)
+
+    for spec in plots_to_run:
+        fig = plot_gene_spot_count_pairplot(
+            cxg_wide,
+            **spec["plot_kwargs"],
+            title_prefix=f"{mouse_id} - ",
+        )
+        _upload_and_close(
+            fig, bucket, mouse_id,
+            spec["plot_type"], spec["plot_kwargs"], source_assets,
+        )
+
+    del cxg_wide
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -185,12 +207,15 @@ def run_plots(
         allowed = set(plot_types)
         spot_specs = [s for s in SPOTS_PLOTS if s["plot_type"] in allowed]
         taxonomy_specs = [s for s in TAXONOMY_PLOTS if s["plot_type"] in allowed]
+        cxg_specs = [s for s in CXG_PLOTS if s["plot_type"] in allowed]
     else:
         spot_specs = SPOTS_PLOTS
         taxonomy_specs = TAXONOMY_PLOTS
+        cxg_specs = CXG_PLOTS
 
     run_spots_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, spot_specs)
     run_taxonomy_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, taxonomy_specs)
+    run_cxg_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, cxg_specs)
 
 
 def run(

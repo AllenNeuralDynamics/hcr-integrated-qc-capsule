@@ -60,3 +60,23 @@ TAXONOMY_PLOTS = [
     for orientation in ["ZX", "XY"]
     for cluster_key in ["class_name", "subclass_name", "supertype_name"]
 ]
+
+# ---------------------------------------------------------------------------
+# CXG plots  (data: pw_dataset.load_aggregated_cxg)
+# ---------------------------------------------------------------------------
+
+CXG_PLOTS = [
+    {
+        "plot_type": "spots_count_pairplot_inhibitory",
+        "plot_kwargs": {
+            "genes_to_plot": ["Gad2", "Sst", "Pvalb", "Vip", "Npy"],
+            "n_sample": 40_000,
+        },
+    },
+    {
+        "plot_type": "spots_count_pairplot_all",
+        "plot_kwargs": {
+            "n_sample": 40_000,
+        },
+    },
+]
