@@ -7,6 +7,7 @@ Example usage:
 """
 
 import argparse
+import boto3
 import matplotlib.pyplot as plt
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from aind_hcr_data_loader.pairwise_dataset import create_pairwise_unmixing_datas
 from aind_hcr_qc.viz.intergrated_datasets import plot_intensity_violins, plot_gene_spot_count_pairplot
 from aind_hcr_qc.viz.spectral_unmixing import plot_channel_intensity_histograms_by_round
 import aind_hcr_qc.viz.cell_x_gene
-from aind_hcr_qc.utils.s3_qc import QC_S3_BUCKET, check_plot_exists, upload_plot
+from aind_hcr_qc.utils.s3_qc import QC_S3_BUCKET, QC_S3_PREFIX, check_plot_exists, upload_plot
 
 from plot_configs import SPOTS_PLOTS, TAXONOMY_PLOTS, CXG_PLOTS
 
@@ -54,7 +55,63 @@ def load_data(mouse_id):
         "rounds": dict(record.rounds),
         **{k: v for k, v in record.derived_assets.items() if v is not None},
     }
-    return dataset, pw_dataset, source_assets
+    return dataset, pw_dataset, source_assets, record
+
+
+_SUBSET_PREFIX = {
+    "all": "taxonomy_all_map",
+    "inhibitory": "taxonomy_inh_map",
+}
+
+
+# ---------------------------------------------------------------------------
+# Cell-typing plot copy
+# ---------------------------------------------------------------------------
+
+def copy_cell_typing_plots(
+    mouse_id: str,
+    record: MouseRecord,
+    data_dir: Path = DATA_DIR,
+    bucket: str = QC_S3_BUCKET,
+    overwrite: bool = False,
+) -> None:
+    """Upload pre-generated cell-typing plots from the data asset to S3.
+
+    Source files are uploaded under the canonical QC prefix with a
+    ``taxonomy_all_map_`` / ``taxonomy_inh_map_`` prefix so the data viewer
+    can distinguish subset and plot type.
+
+    S3 key pattern::
+
+        ctl/hcr/qc/{mouse_id}/{subset_prefix}_{original_stem}.png
+    """
+    cell_typing_asset = record.derived_assets.get("cell_typing")
+    if cell_typing_asset is None:
+        print(f"Mouse {mouse_id}: no cell_typing asset in catalog — skipping upload.")
+        return
+
+    cell_typing_dir = data_dir / cell_typing_asset
+    s3 = boto3.client("s3")
+
+    for subset, prefix in _SUBSET_PREFIX.items():
+        plots_dirs = sorted((cell_typing_dir / f"{subset}_cells").glob("*/plots"))
+        if not plots_dirs:
+            print(f"Mouse {mouse_id}: no plots directory found under {subset}_cells — skipping.")
+            continue
+
+        plots_dir = plots_dirs[0]
+        for src in sorted(plots_dir.glob("*.png")):
+            plot_type = f"{prefix}_{src.stem}"
+            if not overwrite and check_plot_exists(bucket, mouse_id, plot_type):
+                print(f"  [skip] {plot_type} already exists on S3. Pass --overwrite to replace.")
+                continue
+            s3.upload_file(
+                Filename=str(src),
+                Bucket=bucket,
+                Key=f"{QC_S3_PREFIX}/{mouse_id}/{plot_type}.png",
+                ExtraArgs={"ContentType": "image/png"},
+            )
+            print(f"  [upload] {src.relative_to(data_dir)} -> s3://{bucket}/{QC_S3_PREFIX}/{mouse_id}/{plot_type}.png")
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +281,7 @@ def run(
     overwrite: bool = False,
     plot_types: list[str] | None = None,
 ) -> None:
-    dataset, pw_dataset, source_assets = load_data(mouse_id)
+    dataset, pw_dataset, source_assets, record = load_data(mouse_id)
     run_plots(
         mouse_id, pw_dataset,
         source_assets=source_assets,
@@ -232,6 +289,7 @@ def run(
         overwrite=overwrite,
         plot_types=plot_types,
     )
+    copy_cell_typing_plots(mouse_id, record, bucket=bucket, overwrite=overwrite)
 
 
 if __name__ == "__main__":
