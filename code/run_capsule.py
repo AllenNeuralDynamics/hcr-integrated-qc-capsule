@@ -10,6 +10,7 @@ import argparse
 import boto3
 import matplotlib.pyplot as plt
 from pathlib import Path
+import json
 
 from aind_hcr_data_loader.codeocean_utils import (
     MouseRecord,
