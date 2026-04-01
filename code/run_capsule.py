@@ -29,6 +29,8 @@ CATALOG_BASE = Path("/src/ophys-mfish-dataset-catalog/mice")
 DATA_DIR = Path("/root/capsule/data")
 OUTPUT_DIR = Path("/root/capsule/results")
 
+NG_LINK_FILENAME = "ng_links.json"
+
 
 def load_data(mouse_id):
     catalog_path = CATALOG_BASE / f"{mouse_id}.json"
@@ -62,6 +64,94 @@ _SUBSET_PREFIX = {
     "all": "taxonomy_all_map",
     "inhibitory": "taxonomy_inh_map",
 }
+
+
+# ---------------------------------------------------------------------------
+# Neuroglancer link collection
+# ---------------------------------------------------------------------------
+
+def _collect_ng_links_for_round(asset_dir: Path) -> list[dict]:
+    """Return a list of {name, url} dicts for every NG JSON in *asset_dir*.
+
+    Scans all *.json files at the top level of the folder.  A file is treated
+    as a neuroglancer link file if it contains a top-level ``ng_link`` key.
+    """
+    links = []
+    if not asset_dir.is_dir():
+        return links
+    for json_path in sorted(asset_dir.glob("*.json")):
+        try:
+            data = json.loads(json_path.read_text())
+        except Exception:
+            continue
+        url = data.get("ng_link")
+        if isinstance(url, str) and url.startswith("http"):
+            links.append({"name": json_path.stem, "url": url})
+    return links
+
+
+def collect_and_upload_ng_links(
+    mouse_id: str,
+    record: MouseRecord,
+    data_dir: Path = DATA_DIR,
+    bucket: str = QC_S3_BUCKET,
+    overwrite: bool = False,
+) -> None:
+    """Scan each round's dataset folder for neuroglancer JSON files and upload
+    a consolidated ``ng_links.json`` to S3.
+
+    S3 key::
+
+        ctl/hcr/qc/{mouse_id}/ng_links.json
+
+    Structure of the uploaded JSON::
+
+        {
+          "mouse_id": "755252",
+          "rounds": {
+            "R1": [{"name": "fused_ng", "url": "https://..."}],
+            "R2": [...]
+          }
+        }
+
+    All ng files are included (fused, camera_aligned, radially_corrected,
+    multichannel_spot_annotation, cc_ng_*, etc.).
+    """
+    s3_key = f"{QC_S3_PREFIX}/{mouse_id}/{NG_LINK_FILENAME}"
+    s3 = boto3.client("s3")
+
+    if not overwrite:
+        from botocore.exceptions import ClientError as _ClientError
+        try:
+            s3.head_object(Bucket=bucket, Key=s3_key)
+            print(
+                f"  [skip] ng_links.json already exists on S3 for mouse {mouse_id}."
+                " Pass --overwrite to replace."
+            )
+            return
+        except _ClientError as exc:
+            if exc.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+                raise
+
+    rounds_links: dict[str, list] = {}
+    for round_label, asset_name in record.rounds.items():
+        asset_dir = data_dir / asset_name
+        links = _collect_ng_links_for_round(asset_dir)
+        rounds_links[round_label] = links
+        print(f"  [ng_links] {round_label} ({asset_name}): {len(links)} link(s) found")
+
+    payload = {
+        "mouse_id": mouse_id,
+        "rounds": rounds_links,
+    }
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=json.dumps(payload, indent=2).encode(),
+        ContentType="application/json",
+    )
+    print(f"  [upload] ng_links.json -> s3://{bucket}/{s3_key}")
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +380,7 @@ def run(
         plot_types=plot_types,
     )
     copy_cell_typing_plots(mouse_id, record, bucket=bucket, overwrite=overwrite)
+    collect_and_upload_ng_links(mouse_id, record, bucket=bucket, overwrite=overwrite)
 
 
 if __name__ == "__main__":
