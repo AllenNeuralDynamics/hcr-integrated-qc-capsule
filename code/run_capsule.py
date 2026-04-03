@@ -25,7 +25,7 @@ import aind_hcr_qc.viz.cell_x_gene
 from aind_hcr_qc.utils.s3_qc import QC_S3_BUCKET, QC_S3_PREFIX, check_plot_exists, upload_plot
 
 from plot_configs import SPOTS_PLOTS, TAXONOMY_PLOTS, CXG_PLOTS
-from metrics import collect_spots_metrics, load_mouse_metrics, save_mouse_metrics
+from metrics import collect_spots_metrics, collect_cxg_metrics, load_mouse_metrics, save_mouse_metrics
 
 CATALOG_BASE = Path("/src/ophys-mfish-dataset-catalog/mice")
 DATA_DIR = Path("/root/capsule/data")
@@ -379,6 +379,7 @@ def run_metrics(
 
     metrics = load_mouse_metrics(mouse_id)
     changed = collect_spots_metrics(pw_dataset, metrics, overwrite=overwrite)
+    changed |= collect_cxg_metrics(pw_dataset, metrics, overwrite=overwrite)
     if changed:
         save_mouse_metrics(mouse_id, metrics)
 
