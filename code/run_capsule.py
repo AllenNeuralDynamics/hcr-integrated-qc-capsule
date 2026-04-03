@@ -25,6 +25,7 @@ import aind_hcr_qc.viz.cell_x_gene
 from aind_hcr_qc.utils.s3_qc import QC_S3_BUCKET, QC_S3_PREFIX, check_plot_exists, upload_plot
 
 from plot_configs import SPOTS_PLOTS, TAXONOMY_PLOTS, CXG_PLOTS
+from metrics import collect_spots_metrics, load_mouse_metrics, save_mouse_metrics
 
 CATALOG_BASE = Path("/src/ophys-mfish-dataset-catalog/mice")
 DATA_DIR = Path("/root/capsule/data")
@@ -366,6 +367,22 @@ def run_plots(
     run_cxg_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, cxg_specs)
 
 
+def run_metrics(
+    mouse_id: str,
+    pw_dataset,
+    overwrite: bool = False,
+) -> None:
+    """Collect all QC metrics for *mouse_id* and write to scratch/metrics/."""
+    if pw_dataset is None:
+        print("No pairwise dataset — skipping metrics.")
+        return
+
+    metrics = load_mouse_metrics(mouse_id)
+    changed = collect_spots_metrics(pw_dataset, metrics, overwrite=overwrite)
+    if changed:
+        save_mouse_metrics(mouse_id, metrics)
+
+
 def run(
     mouse_id: str,
     bucket: str = QC_S3_BUCKET,
@@ -373,6 +390,7 @@ def run(
     plot_types: list[str] | None = None,
 ) -> None:
     dataset, pw_dataset, source_assets, record = load_data(mouse_id)
+    run_metrics(mouse_id, pw_dataset, overwrite=overwrite)
     run_plots(
         mouse_id, pw_dataset,
         source_assets=source_assets,
