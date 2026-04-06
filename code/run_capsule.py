@@ -11,6 +11,7 @@ import boto3
 import matplotlib.pyplot as plt
 from pathlib import Path
 import json
+import re
 
 from aind_hcr_data_loader.codeocean_utils import (
     MouseRecord,
@@ -22,7 +23,15 @@ from aind_hcr_data_loader.pairwise_dataset import create_pairwise_unmixing_datas
 from aind_hcr_qc.viz.intergrated_datasets import plot_intensity_violins, plot_gene_spot_count_pairplot
 from aind_hcr_qc.viz.spectral_unmixing import plot_channel_intensity_histograms_by_round
 import aind_hcr_qc.viz.cell_x_gene
-from aind_hcr_qc.utils.s3_qc import QC_S3_BUCKET, QC_S3_PREFIX, check_plot_exists, upload_plot
+from aind_hcr_qc.utils.s3_qc import (
+    QC_S3_BUCKET,
+    QC_S3_PREFIX,
+    check_plot_exists,
+    upload_plot,
+    check_round_plot_exists,
+    upload_round_plot,
+)
+from aind_hcr_qc.viz.sample_overview import plot_tile_overview, raw_asset_name_from_processed
 
 from plot_configs import SPOTS_PLOTS, TAXONOMY_PLOTS, CXG_PLOTS
 from metrics import collect_spots_metrics, collect_cxg_metrics, load_mouse_metrics, save_mouse_metrics
@@ -367,6 +376,74 @@ def run_plots(
     run_cxg_plots(mouse_id, pw_dataset, source_assets, bucket, overwrite, cxg_specs)
 
 
+# ---------------------------------------------------------------------------
+# Round-specific QC
+# ---------------------------------------------------------------------------
+
+def run_round_qc(
+    mouse_id: str,
+    dataset,
+    record: "MouseRecord",
+    bucket: str = QC_S3_BUCKET,
+    overwrite: bool = False,
+    channel: str = "405",
+    pyramid_level: int = 3,
+) -> None:
+    """Generate per-round tile overview plots and upload to S3.
+
+    Each round's plot is stored under its own asset sub-folder so that
+    processed and raw assets occupy distinct S3 paths::
+
+        ctl/hcr/qc/{mouse_id}/{processed_asset_name}/tile_overview_ch{channel}.png
+
+    The raw asset name (stripped of the ``_processed_*`` suffix) is recorded
+    in the JSON sidecar for provenance but is not used as a data source
+    (fused zarrs live in the processed asset).
+    """
+    plot_type = f"tile_overview_ch{channel}"
+
+    for round_key, processed_name in record.rounds.items():
+        raw_name = raw_asset_name_from_processed(processed_name)
+
+        if not overwrite and check_round_plot_exists(
+            bucket, mouse_id, processed_name, plot_type
+        ):
+            print(
+                f"  [skip] {round_key} {plot_type} already on S3 for mouse {mouse_id}."
+                " Pass --overwrite to replace."
+            )
+            continue
+
+        hcr_round = dataset.rounds.get(round_key)
+        if hcr_round is None:
+            print(f"  [skip] {round_key} not found in dataset — skipping.")
+            continue
+
+        print(f"  [round qc] {round_key}: generating {plot_type} ...")
+        fig = plot_tile_overview(hcr_round, channel=channel, pyramid_level=pyramid_level)
+        gene_dict = hcr_round.processing_manifest.get("gene_dict", {})
+        upload_round_plot(
+            fig=fig,
+            bucket=bucket,
+            mouse_id=mouse_id,
+            asset_name=processed_name,
+            plot_type=plot_type,
+            metadata={
+                "round_label": round_key,
+                "source_assets": {
+                    "processed": processed_name,
+                    "raw": raw_name,
+                },
+                "plot_kwargs": {
+                    "channel": channel,
+                    "pyramid_level": pyramid_level,
+                },
+                "gene_dict": gene_dict,
+            },
+        )
+        plt.close(fig)
+
+
 def run_metrics(
     mouse_id: str,
     pw_dataset,
@@ -392,6 +469,7 @@ def run(
 ) -> None:
     dataset, pw_dataset, source_assets, record = load_data(mouse_id)
     run_metrics(mouse_id, pw_dataset, overwrite=overwrite)
+    run_round_qc(mouse_id, dataset, record, bucket=bucket, overwrite=overwrite)
     run_plots(
         mouse_id, pw_dataset,
         source_assets=source_assets,
