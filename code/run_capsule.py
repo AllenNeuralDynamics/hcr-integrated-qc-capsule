@@ -14,7 +14,8 @@ import json
 import re
 
 from aind_hcr_data_loader.codeocean_utils import (
-    MouseRecord,
+        MouseRecord,
+)
     attach_mouse_record_to_workstation,
     print_attach_results,
 )
@@ -46,7 +47,7 @@ NG_LINK_FILENAME = "ng_links.json"
 def load_data(mouse_id):
     catalog_path = CATALOG_BASE / f"{mouse_id}.json"
 
-    record = MouseRecord.from_json_file(catalog_path)
+        record = MouseRecord.from_json_file(catalog_path)
     results = attach_mouse_record_to_workstation(record)
     print_attach_results(results)
 
