@@ -2007,6 +2007,155 @@ def plot_multi_mouse_match_scores(
     return fig
 
 
+@_saveable_plot()
+def plot_multi_mouse_error_ecdf(
+    comparison: pd.DataFrame,
+    spot_filter: Optional[str] = None,
+    figsize: Optional[Tuple] = None,
+    title: str = "ECDF of absolute log2 O/E error: raw vs unmixed (pooled mice)",
+) -> "plt.Figure":
+    """
+    ECDF of raw vs unmixed absolute log2 O/E error, pooled across all mice.
+
+    One panel per ``spot_filter``.  Two bold curves show the pooled raw
+    (dashed, red) and unmixed (solid, green) distributions.  Thin per-mouse
+    lines are drawn at low opacity to convey animal-to-animal variability.
+    A leftward shift in the unmixed curve indicates error reduction.
+
+    Parameters
+    ----------
+    comparison:
+        Combined comparison CSV.  Must have ``mouse_id``, ``spot_filter``,
+        ``raw_abs_error``, ``unmixed_abs_error``.
+    spot_filter:
+        If given, restrict to this filter value.
+    figsize:
+        Override figure size.
+    title:
+        Figure suptitle.
+    """
+    import re as _re
+    import numpy as _np
+
+    RAW_COLOR    = "#d62728"
+    UNMIX_COLOR  = "#2ca02c"
+
+    df = comparison.copy()
+    if spot_filter is not None:
+        df = df[df["spot_filter"] == spot_filter]
+
+    filters = sorted(df["spot_filter"].unique())
+    mice    = sorted(df["mouse_id"].astype(str).unique(), key=lambda s: [int(t) if t.isdigit() else t for t in _re.split(r"(\d+)", s)])
+
+    n_panels = len(filters)
+    fw, fh = figsize or (5.5 * n_panels, 4.5)
+    fig, axes = plt.subplots(1, n_panels, figsize=(fw, fh), squeeze=False)
+
+    for ax, filt in zip(axes[0], filters):
+        sub = df[df["spot_filter"] == filt]
+
+        # Thin per-mouse lines for variability context
+        for mouse in mice:
+            msub = sub[sub["mouse_id"].astype(str) == mouse]
+            for col, color in [("raw_abs_error", RAW_COLOR), ("unmixed_abs_error", UNMIX_COLOR)]:
+                vals = _np.sort(msub[col].dropna().values)
+                if len(vals) == 0:
+                    continue
+                ecdf_y = _np.arange(1, len(vals) + 1) / len(vals)
+                ax.plot(vals, ecdf_y, color=color, linewidth=0.7, alpha=0.25)
+
+        # Bold pooled curves
+        for col, color, ls in [
+            ("raw_abs_error",    RAW_COLOR,   "--"),
+            ("unmixed_abs_error", UNMIX_COLOR, "-"),
+        ]:
+            vals = _np.sort(sub[col].dropna().values)
+            if len(vals) == 0:
+                continue
+            ecdf_y = _np.arange(1, len(vals) + 1) / len(vals)
+            ax.plot(vals, ecdf_y, color=color, linestyle=ls, linewidth=2.2)
+
+        ax.set_xlabel("Absolute log2 O/E error")
+        ax.set_ylabel("Cumulative proportion")
+        ax.set_xlim(0, 5)
+        ax.set_ylim(0, 1.05)
+        ax.set_title(f"spot_filter = {filt}")
+        ax.axhline(0.5, color="gray", linewidth=0.7, linestyle=":")
+
+    handles = [
+        plt.Line2D([0], [0], color=RAW_COLOR,   linestyle="--", linewidth=2, label="raw"),
+        plt.Line2D([0], [0], color=UNMIX_COLOR,  linestyle="-",  linewidth=2, label="unmixed"),
+    ]
+    fig.legend(handles=handles, title="condition", bbox_to_anchor=(1.01, 0.95), loc="upper left", fontsize=9)
+    fig.suptitle(title, y=1.02)
+    plt.tight_layout()
+    return fig
+
+
+@_saveable_plot()
+def plot_multi_mouse_filter_ecdf(
+    comparison: pd.DataFrame,
+    figsize: Optional[Tuple] = None,
+    title: str = "ECDF by spot_filter: raw vs unmixed (pooled mice)",
+) -> "plt.Figure":
+    """
+    Single-panel ECDF comparing raw and unmixed error across all ``spot_filter``
+    values, pooled across mice.
+
+    Each ``spot_filter`` gets a distinct colour.  Within each filter, the
+    dashed line is raw and the solid line is unmixed.  This lets you see both
+    how filters differ in baseline error *and* how much unmixing helps within
+    each filter.
+
+    Parameters
+    ----------
+    comparison:
+        Combined comparison CSV.  Must have ``mouse_id``, ``spot_filter``,
+        ``raw_abs_error``, ``unmixed_abs_error``.
+    figsize:
+        Override figure size.
+    title:
+        Figure suptitle.
+    """
+    import numpy as _np
+
+    df = comparison.copy()
+
+    filters = sorted(df["spot_filter"].unique())
+    cmap    = plt.cm.get_cmap("Set1", len(filters))
+    colors  = {f: cmap(i) for i, f in enumerate(filters)}
+
+    fw, fh = figsize or (6.0, 4.5)
+    fig, ax = plt.subplots(figsize=(fw, fh))
+
+    for filt in filters:
+        sub = df[df["spot_filter"] == filt]
+        for col, ls in [("raw_abs_error", "--"), ("unmixed_abs_error", "-")]:
+            vals = _np.sort(sub[col].dropna().values)
+            if len(vals) == 0:
+                continue
+            ecdf_y = _np.arange(1, len(vals) + 1) / len(vals)
+            ax.plot(vals, ecdf_y, color=colors[filt], linestyle=ls, linewidth=1.9, alpha=0.9)
+
+    ax.set_xlabel("Absolute log2 O/E error")
+    ax.set_ylabel("Cumulative proportion")
+    ax.set_xlim(0, 5)
+    ax.set_ylim(0, 1.05)
+    ax.axhline(0.5, color="gray", linewidth=0.7, linestyle=":")
+
+    filter_handles = [
+        plt.Line2D([0], [0], color=colors[f], linewidth=2, label=f) for f in filters
+    ]
+    style_handles = [
+        plt.Line2D([0], [0], color="gray", linestyle="--", linewidth=1.5, label="raw"),
+        plt.Line2D([0], [0], color="gray", linestyle="-",  linewidth=1.5, label="unmixed"),
+    ]
+    ax.legend(handles=filter_handles + style_handles, title="filter / condition", fontsize=9)
+    fig.suptitle(title, y=1.02)
+    plt.tight_layout()
+    return fig
+
+
 def save_all_figures(
     comparison: pd.DataFrame,
     cluster_matches: pd.DataFrame,
