@@ -1693,6 +1693,320 @@ def plot_gene_expression_bias(
         return fig
 
 
+@_saveable_plot()
+def plot_cell_x_gene_with_clusters(
+    spots: pd.DataFrame,
+    cluster_meta: pd.DataFrame,
+    gene_labels: Optional[Dict[str, str]] = None,
+    chan_col: str = "unmixed_gene",
+    clip_range: Tuple[int, int] = (0, 200),
+    figsize: Tuple[float, float] = (8, 10),
+    title: str = "Cell × gene",
+) -> "plt.Figure":
+    """
+    Plot a cell × gene heatmap with cells grouped by pre-computed cluster labels.
+
+    Columns are named and sorted using round-chan-gene display labels from
+    *gene_labels*.  No re-clustering is performed — the cluster assignments
+    already present in *cluster_meta* are used directly.
+
+    Parameters
+    ----------
+    spots:
+        Spot table with columns ``cell_id`` and *chan_col*.
+    cluster_meta:
+        DataFrame indexed by ``cell_id`` with a ``cluster_label`` column.
+    gene_labels:
+        Dict mapping plain gene name → round-chan-gene display label
+        (e.g. ``{"Gad2": "R1-488-Gad2"}``).  When ``None``, plain gene
+        names are used as column headers.
+    chan_col:
+        Column in *spots* containing the gene/channel name.
+    clip_range:
+        ``(min, max)`` count clip applied before plotting.
+    figsize:
+        ``(width, height)`` in inches.
+    title:
+        Plot title.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    import re as _re
+    import seaborn as _sns
+    from aind_hcr_qc.viz.cell_x_gene import plot_cell_x_gene_clustered as _plot_cxg
+
+    _sns.set_context("notebook")
+
+    def _natural_key(s: str):
+        return [int(t) if t.isdigit() else t.lower() for t in _re.split(r"(\d+)", str(s))]
+
+    # 1. Build cell × gene count matrix restricted to cells in cluster_meta
+    counts = spots_to_cell_gene_counts(
+        spots,
+        cell_ids=cluster_meta.index,
+        chan_col=chan_col,
+    )
+
+    # 2. Rename columns to round-chan-gene display labels
+    if gene_labels is not None:
+        counts = counts.rename(columns=gene_labels)
+
+    # Drop any column whose name is the string "nan" (from NaN gene values)
+    counts = counts[[c for c in counts.columns if str(c).lower() != "nan"]]
+
+    # 3. Natural-sort columns so rounds and channels are in order
+    col_order = sorted(counts.columns, key=_natural_key)
+    counts = counts[col_order]
+
+    # 4. Sort rows by cluster_label (natural order), preserving cell_id order within each cluster
+    meta_aligned = cluster_meta.loc[cluster_meta.index.intersection(counts.index)]
+    cluster_order = sorted(meta_aligned["cluster_label"].unique(), key=_natural_key)
+    sorted_ids = pd.Index(
+        [cid for cl in cluster_order for cid in meta_aligned[meta_aligned["cluster_label"] == cl].index]
+    )
+    counts_sorted = counts.reindex(sorted_ids)
+
+    # Drop genes (columns) with all-NaN values, then fill remaining NaN with 0
+    counts_sorted = counts_sorted.dropna(axis=1, how="all").fillna(0).astype(int)
+    cluster_labels_arr = meta_aligned.loc[counts_sorted.index, "cluster_label"].to_numpy()
+
+    # Pre-clip so the cluster_result passed below already has the clipped values
+    # (plot_cell_x_gene_clustered re-assigns cxg from cluster_result, which would
+    #  bypass its own clip step if we don't do it here).
+    counts_clipped = counts_sorted.clip(lower=clip_range[0], upper=clip_range[1])
+
+    # 5. Call the library function with pre-computed clustering — no re-clustering
+    fig, _, _ = _plot_cxg(
+        counts_clipped,
+        clip_range=clip_range,
+        fig_size=figsize,
+        cluster_result=(counts_clipped, cluster_labels_arr, counts_clipped.index),
+        gene_sort=None,
+        add_cluster_labels=True,
+        title=title,
+    )
+
+    # Pin the colormap to exactly clip_range so all plots use a consistent scale
+    for ax in fig.axes:
+        for im in ax.get_images():
+            im.set_clim(clip_range[0], clip_range[1])
+
+    return fig
+
+
+# -----------------------------------------------------------------------------
+# Multi-mouse combined-results plots
+# -----------------------------------------------------------------------------
+
+
+@_saveable_plot()
+def plot_multi_mouse_error_improvement(
+    comparison: pd.DataFrame,
+    spot_filter: Optional[str] = None,
+    figsize: Optional[Tuple] = None,
+    title: str = "Reference error before vs after unmixing (all mice)",
+) -> "plt.Figure":
+    """
+    Scatter of raw vs unmixed absolute log2 O/E error for all mice.
+
+    One subplot per ``spot_filter`` value present in *comparison*.  Points are
+    coloured by ``mouse_id``.
+
+    Parameters
+    ----------
+    comparison:
+        Combined comparison CSV loaded as a DataFrame.  Must have columns
+        ``mouse_id``, ``spot_filter``, ``raw_abs_error``, ``unmixed_abs_error``.
+    spot_filter:
+        If given, restrict to this filter value (e.g. ``"valid"``).
+    figsize:
+        Override figure size.
+    title:
+        Figure suptitle.
+    """
+    import re as _re
+
+    df = comparison.copy()
+    if spot_filter is not None:
+        df = df[df["spot_filter"] == spot_filter]
+
+    filters = sorted(df["spot_filter"].unique())
+    mice    = sorted(df["mouse_id"].astype(str).unique(), key=lambda s: [int(t) if t.isdigit() else t for t in _re.split(r"(\d+)", s)])
+    cmap    = plt.cm.get_cmap("tab10", len(mice))
+    colors  = {m: cmap(i) for i, m in enumerate(mice)}
+
+    n_panels = len(filters)
+    fw, fh = figsize or (5.5 * n_panels, 5.0)
+    fig, axes = plt.subplots(1, n_panels, figsize=(fw, fh), squeeze=False)
+
+    lim = max(df["raw_abs_error"].max(), df["unmixed_abs_error"].max()) * 1.05
+
+    for ax, filt in zip(axes[0], filters):
+        sub = df[df["spot_filter"] == filt]
+        for mouse in mice:
+            msub = sub[sub["mouse_id"].astype(str) == mouse]
+            ax.scatter(
+                msub["raw_abs_error"], msub["unmixed_abs_error"],
+                color=colors[mouse], alpha=0.45, s=18, label=str(mouse),
+            )
+        ax.plot([0, lim], [0, lim], color="steelblue", linewidth=1.2)
+        ax.set_xlim(-0.1, lim)
+        ax.set_ylim(-0.1, lim)
+        ax.set_xlabel("Raw absolute log2 O/E error")
+        ax.set_ylabel("Unmixed absolute log2 O/E error")
+        ax.set_title(f"spot_filter = {filt}")
+
+    handles = [plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=colors[m], markersize=7, label=m) for m in mice]
+    fig.legend(handles=handles, title="mouse_id", bbox_to_anchor=(1.01, 0.9), loc="upper left", fontsize=9)
+    fig.suptitle(title, y=1.02)
+    plt.tight_layout()
+    return fig
+
+
+@_saveable_plot()
+def plot_multi_mouse_improvement_by_gene(
+    comparison: pd.DataFrame,
+    spot_filter: Optional[str] = None,
+    figsize: Optional[Tuple] = None,
+    title: str = "Mean unmixing improvement by gene (all mice)",
+) -> "plt.Figure":
+    """
+    Horizontal bar chart of mean improvement per gene across all mice.
+
+    One subplot per ``spot_filter``.  Each bar shows the cross-mouse mean;
+    individual mouse values are overlaid as jittered dots.
+
+    Parameters
+    ----------
+    comparison:
+        Combined comparison CSV.  Must have ``mouse_id``, ``spot_filter``,
+        ``gene``, ``improvement``.
+    spot_filter:
+        If given, restrict to this filter value.
+    figsize:
+        Override figure size.
+    title:
+        Figure suptitle.
+    """
+    import re as _re
+
+    df = comparison.copy()
+    if spot_filter is not None:
+        df = df[df["spot_filter"] == spot_filter]
+
+    filters = sorted(df["spot_filter"].unique())
+    mice    = sorted(df["mouse_id"].astype(str).unique(), key=lambda s: [int(t) if t.isdigit() else t for t in _re.split(r"(\d+)", s)])
+    cmap    = plt.cm.get_cmap("tab10", len(mice))
+    colors  = {m: cmap(i) for i, m in enumerate(mice)}
+
+    # Gene list: derive from the FULL comparison so genes measured by only some
+    # mice or only one spot_filter still appear in every panel.
+    gene_mean = comparison.groupby("gene")["improvement"].mean().sort_values(ascending=True)
+    genes = gene_mean.index.tolist()
+
+    n_panels = len(filters)
+    fw, fh = figsize or (7.0, max(4, 0.4 * len(genes)))
+    fig, axes = plt.subplots(1, n_panels, figsize=(fw * n_panels, fh), squeeze=False)
+
+    rng = __import__("numpy").random.default_rng(0)
+
+    for ax, filt in zip(axes[0], filters):
+        sub = df[df["spot_filter"] == filt]
+        means = sub.groupby("gene")["improvement"].mean().reindex(genes)
+        colors_bar = ["#d62728" if v < 0 else "#2ca02c" for v in means]
+        ax.barh(genes, means, color=colors_bar, alpha=0.65, zorder=2)
+
+        for mouse in mice:
+            msub = sub[sub["mouse_id"].astype(str) == mouse]
+            gene_vals = msub.groupby("gene")["improvement"].mean().reindex(genes)
+            y_jitter  = rng.uniform(-0.25, 0.25, size=len(genes))
+            ax.scatter(
+                gene_vals, __import__("numpy").arange(len(genes)) + y_jitter,
+                color=colors[mouse], s=18, zorder=3, alpha=0.85, label=str(mouse),
+            )
+
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.set_yticks(range(len(genes)))
+        ax.set_yticklabels(genes)
+        ax.set_xlabel("Mean improvement (Δ|log₂ O/E|)")
+        ax.set_title(f"spot_filter = {filt}")
+
+    handles = [plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=colors[m], markersize=7, label=m) for m in mice]
+    fig.legend(handles=handles, title="mouse_id", bbox_to_anchor=(1.01, 0.9), loc="upper left", fontsize=9)
+    fig.suptitle(title, y=1.02)
+    plt.tight_layout()
+    return fig
+
+
+@_saveable_plot()
+def plot_multi_mouse_match_scores(
+    cluster_matches: pd.DataFrame,
+    spot_filter: Optional[str] = None,
+    figsize: Optional[Tuple] = None,
+    title: str = "Cluster → reference match scores (all mice)",
+) -> "plt.Figure":
+    """
+    Strip + box plot of cluster-to-reference cosine match scores per mouse.
+
+    One subplot per ``spot_filter``.  Each mouse is one group on the x-axis;
+    each dot is one cluster.
+
+    Parameters
+    ----------
+    cluster_matches:
+        Combined cluster_matches CSV.  Must have ``mouse_id``, ``spot_filter``,
+        ``match_score``.
+    spot_filter:
+        If given, restrict to this filter value.
+    figsize:
+        Override figure size.
+    title:
+        Figure suptitle.
+    """
+    import re as _re
+    import numpy as _np
+
+    df = cluster_matches.copy()
+    if spot_filter is not None:
+        df = df[df["spot_filter"] == spot_filter]
+
+    filters = sorted(df["spot_filter"].unique())
+    mice    = sorted(df["mouse_id"].astype(str).unique(), key=lambda s: [int(t) if t.isdigit() else t for t in _re.split(r"(\d+)", s)])
+    cmap    = plt.cm.get_cmap("tab10", len(mice))
+    colors  = {m: cmap(i) for i, m in enumerate(mice)}
+
+    n_panels = len(filters)
+    fw, fh = figsize or (max(5, 1.2 * len(mice)) * n_panels, 4.5)
+    fig, axes = plt.subplots(1, n_panels, figsize=(fw, fh), squeeze=False)
+
+    rng = _np.random.default_rng(0)
+
+    for ax, filt in zip(axes[0], filters):
+        sub = df[df["spot_filter"] == filt]
+        for xi, mouse in enumerate(mice):
+            vals = sub[sub["mouse_id"].astype(str) == mouse]["match_score"].dropna().values
+            bp = ax.boxplot(vals, positions=[xi], widths=0.4, patch_artist=True,
+                            boxprops=dict(facecolor=colors[mouse], alpha=0.35),
+                            medianprops=dict(color="black", linewidth=1.5),
+                            whiskerprops=dict(linewidth=1), capprops=dict(linewidth=1),
+                            flierprops=dict(marker=""), showfliers=False)
+            jitter = rng.uniform(-0.15, 0.15, size=len(vals))
+            ax.scatter(xi + jitter, vals, color=colors[mouse], s=22, alpha=0.75, zorder=3)
+
+        ax.set_xticks(range(len(mice)))
+        ax.set_xticklabels(mice, rotation=30, ha="right")
+        ax.set_ylabel("Cosine match score")
+        ax.set_ylim(0, 1.05)
+        ax.set_title(f"spot_filter = {filt}")
+        ax.axhline(1.0, color="gray", linewidth=0.8, linestyle="--")
+
+    fig.suptitle(title, y=1.02)
+    plt.tight_layout()
+    return fig
+
+
 def save_all_figures(
     comparison: pd.DataFrame,
     cluster_matches: pd.DataFrame,
