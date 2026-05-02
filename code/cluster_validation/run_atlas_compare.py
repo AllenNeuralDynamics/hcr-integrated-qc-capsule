@@ -11,6 +11,7 @@ Example usage
 """
 
 import argparse
+import gc
 import warnings
 from pathlib import Path
 
@@ -57,8 +58,16 @@ MIN_LABEL_CELLS  = 10
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_data(mouse_id: str):
-    """Attach assets and build the pairwise dataset for *mouse_id*."""
+def _load_data(mouse_id: str, legacy: bool = False):
+    """Attach assets and build the dataset for *mouse_id*.
+
+    Parameters
+    ----------
+    legacy:
+        When True, return the base HCRDataset instead of wrapping it in a
+        PairwiseUnmixingDataset.  Use this to run the pipeline on the original
+        (pre-pairwise) unmixed data.
+    """
     catalog_path = CATALOG_BASE / f"{mouse_id}.json"
     if not catalog_path.exists():
         raise FileNotFoundError(f"Catalog file not found: {catalog_path}")
@@ -69,6 +78,10 @@ def _load_data(mouse_id: str):
 
     dataset = create_hcr_dataset_from_schema(catalog_path, DATA_DIR)
     dataset.summary()
+
+    if legacy:
+        print("[legacy mode] Using base HCRDataset (skipping pairwise unmixing asset).")
+        return dataset
 
     pairwise_asset_name = record.derived_assets.get("pairwise_unmixing")
     if pairwise_asset_name is None:
@@ -108,10 +121,21 @@ def _load_spots(pw_ds):
     mixed_spots   = pw_ds.load_all_rounds_spots_mp(table_type="mixed_spots",   remove_fg_bg_cols=True)
     unmixed_spots = pw_ds.load_all_rounds_spots_mp(table_type="unmixed_spots",  remove_fg_bg_cols=False)
 
-    # Drop unassigned spots (cell_id == 0).
-    mixed_spots_filt    = mixed_spots[mixed_spots["cell_id"] > 0]
-    unmixed_spots_all   = unmixed_spots[unmixed_spots["cell_id"] > 0]
-    unmixed_spots_valid = unmixed_spots[(unmixed_spots["cell_id"] > 0) & unmixed_spots["valid_spot"]]
+    # Drop unassigned spots (cell_id == 0); copy() materialises filtered results
+    # so we can immediately free the full raw tables.
+    mixed_spots_filt    = mixed_spots[mixed_spots["cell_id"] > 0].copy()
+    unmixed_spots_all   = unmixed_spots[unmixed_spots["cell_id"] > 0].copy()
+    unmixed_spots_valid = unmixed_spots[(unmixed_spots["cell_id"] > 0) & unmixed_spots["valid_spot"]].copy()
+
+    # Free the full raw tables — they are no longer needed.
+    del mixed_spots, unmixed_spots
+    gc.collect()
+
+    # Drop valid_spot column from both unmixed tables — it has been used for
+    # splitting and is not needed downstream.
+    for _df in (unmixed_spots_all, unmixed_spots_valid):
+        if "valid_spot" in _df.columns:
+            _df.drop(columns="valid_spot", inplace=True)
 
     print(
         f"Spots loaded — mixed: {len(mixed_spots_filt):,}  "
@@ -128,6 +152,69 @@ def _load_cluster_meta(pw_ds) -> pd.DataFrame:
     cluster_cids   = pw_ds.load_sorted_cell_ids().squeeze()
     cluster_meta   = pd.DataFrame({"cluster_label": cluster_labels, "cell_id": cluster_cids})
     return cluster_meta.set_index("cell_id")
+
+
+def _load_cluster_meta_legacy(mouse_id: str) -> pd.DataFrame:
+    """Load cluster metadata for a legacy (non-pairwise) analysis run.
+
+    Two strategies are available:
+
+    **Strategy A — Borrow labels from the pairwise dataset (current implementation)**
+        The pairwise unmixing dataset for this mouse is instantiated solely to
+        read its pre-computed cluster labels and matching sorted cell IDs.  No
+        spot data is loaded from the pairwise asset.  Because ``_load_data``
+        already called ``attach_mouse_record_to_workstation``, the pairwise
+        asset path is already mounted and no second attachment step is needed.
+        The returned cell IDs serve as an implicit filter: only cells present in
+        the pairwise clustering will appear in ``cluster_meta``, and downstream
+        spot tables are filtered to those cell IDs naturally via ``cell_id > 0``.
+
+    **Strategy B — Re-cluster from legacy spots (NOT YET IMPLEMENTED)**
+        Cluster labels could be derived de-novo from the legacy unmixed spot
+        count matrix using k-means (or a graph-based method such as Leiden).
+        This would make the analysis fully independent of the pairwise pipeline
+        and is the only option for mice that have no ``pairwise_unmixing``
+        derived asset.
+
+        TODO: implement Strategy B.  Key decisions needed:
+          - choice of *k* (or resolution for graph methods)
+          - spot-count normalisation strategy (CPM, scran, etc.)
+          - reproducible random seed handling
+          - whether to re-use the ABC-Atlas label vocabulary or assign numeric
+            cluster IDs
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by ``cell_id`` with a ``cluster_label`` column.
+    """
+    # ── Strategy A: instantiate pairwise dataset just for its cluster labels ──
+    catalog_path = CATALOG_BASE / f"{mouse_id}.json"
+    record = MouseRecord.from_json_file(catalog_path)
+
+    pairwise_asset_name = record.derived_assets.get("pairwise_unmixing")
+    if pairwise_asset_name is None:
+        raise ValueError(
+            f"Mouse {mouse_id} has no 'pairwise_unmixing' derived asset — "
+            "cannot borrow cluster labels for legacy analysis.  "
+            "Implement Strategy B (k-means re-clustering) to support this mouse."
+        )
+
+    pairwise_asset_path = DATA_DIR / pairwise_asset_name
+    if (pairwise_asset_path / "pairwise_unmixing").exists():
+        pairwise_asset_path = pairwise_asset_path / "pairwise_unmixing"
+
+    base_ds = create_hcr_dataset_from_schema(catalog_path, DATA_DIR)
+    pw_ds   = create_pairwise_unmixing_dataset(
+        mouse_id            = mouse_id,
+        pairwise_asset_path = pairwise_asset_path,
+        source_dataset      = base_ds,
+        min_dist            = 1,
+    )
+    return _load_cluster_meta(pw_ds)
+
+    # ── Strategy B (stub) ────────────────────────────────────────────────────
+    # raise NotImplementedError("Strategy B k-means re-clustering not yet implemented.")
 
 
 def _build_gene_labels(mixed_spots: pd.DataFrame) -> dict:
@@ -229,6 +316,36 @@ def _load_abc_reference(hcr_genes, v1_merfish_cells, label_level: str):
 
 
 # ---------------------------------------------------------------------------
+# Spot pre-aggregation helper
+# ---------------------------------------------------------------------------
+
+def _preaggregate_spots(
+    spots: pd.DataFrame,
+    gene_col: str,
+    cell_ids,
+    genes: list,
+) -> pd.DataFrame:
+    """Aggregate a spot table to a cell × gene count matrix.
+
+    Uses ``groupby`` rather than ``pd.crosstab`` so that Categorical gene
+    columns are never expanded to Python object strings.  Spots are
+    pre-filtered to *cell_ids* and *genes* before aggregation, further
+    reducing working memory.
+
+    Returns
+    -------
+    pd.DataFrame
+        Shape ``(len(cell_ids), len(genes))``, integer counts, zero-filled.
+    """
+    cell_id_set = set(cell_ids)
+    gene_set    = set(genes)
+    mask        = spots["cell_id"].isin(cell_id_set) & spots[gene_col].isin(gene_set)
+    s           = spots.loc[mask, ["cell_id", gene_col]]
+    counts      = s.groupby(["cell_id", gene_col]).size().unstack(fill_value=0)
+    return counts.reindex(index=cell_ids, columns=genes, fill_value=0)
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -236,8 +353,9 @@ def _run_one(
     label: str,
     spot_filter: str,
     mouse_id: str,
-    mixed_spots: pd.DataFrame,
+    raw_counts: pd.DataFrame,
     unmixed_spots: pd.DataFrame,
+    unmixed_counts: pd.DataFrame,
     cluster_meta: pd.DataFrame,
     gene_labels: dict,
     ref_counts_filt: pd.DataFrame,
@@ -255,9 +373,13 @@ def _run_one(
         Used as a grouping key when CSVs from multiple mice are concatenated.
     mouse_id:
         Written into saved CSVs so rows are identifiable after concatenation.
+    raw_counts:
+        Pre-aggregated raw (mixed) cell × gene count matrix.
+    unmixed_counts:
+        Pre-aggregated unmixed cell × gene count matrix for this run.
     unmixed_spots_valid:
-        Optional valid-only unmixed spots.  When provided a second CXG figure
-        (``12_cxg_clusters_valid.png``) is saved alongside the all-spots one.
+        Optional valid-only unmixed spots DataFrame.  Still required for the
+        cell × gene heatmap (``12_cxg_clusters_valid.png``).
     """
     print(f"\n{'─'*60}")
     print(f"  Run: {label}")
@@ -268,15 +390,17 @@ def _run_one(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     comparison, cluster_matches = atlas_compare.raw_unmixed_reference_comparison(
-        raw_spots        = mixed_spots,
-        unmixed_spots    = unmixed_spots,
-        cell_meta        = cluster_meta,
-        group_col        = "cluster_label",
-        ref_counts       = ref_counts_filt,
-        ref_labels       = ref_labels_filt,
-        raw_chan_col     = "mixed_gene",
-        unmixed_chan_col = "unmixed_gene",
-        matching_source  = "unmixed",
+        raw_spots                  = None,
+        unmixed_spots              = None,
+        cell_meta                  = cluster_meta,
+        group_col                  = "cluster_label",
+        ref_counts                 = ref_counts_filt,
+        ref_labels                 = ref_labels_filt,
+        raw_chan_col               = "mixed_gene",
+        unmixed_chan_col           = "unmixed_gene",
+        matching_source            = "unmixed",
+        precomputed_raw_counts     = raw_counts,
+        precomputed_unmixed_counts = unmixed_counts,
     )
 
     print("Cluster → reference matches:")
@@ -338,18 +462,23 @@ def _run_one(
         print(f"Cell × gene (valid) figure written to: {output_dir}")
 
 
-def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int) -> None:
+def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int, legacy: bool = False) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # When legacy mode is active, tag CSV rows with "<mouse_id>-legacy" so that
+    # outputs from pairwise and legacy runs can be concatenated without ambiguity.
+    csv_mouse_id = f"{mouse_id}-legacy" if legacy else mouse_id
+
     print(f"\n{'='*60}")
-    print(f"Mouse: {mouse_id}")
+    print(f"Mouse: {mouse_id}{' (legacy mode)' if legacy else ''}")
+    print(f"CSV mouse_id tag: {csv_mouse_id}")
     print(f"Output root: {output_dir}")
     print(f"Reference label level: {label_level}")
     print(f"{'='*60}\n")
 
-    # ── 1. Load pairwise dataset ──────────────────────────────────────────────
+    # ── 1. Load dataset ───────────────────────────────────────────────────────
     print("[1/5] Loading dataset …")
-    pw_ds = _load_data(mouse_id)
+    pw_ds = _load_data(mouse_id, legacy=legacy)
 
     # ── 2. Load and annotate spots ────────────────────────────────────────────
     print("[2/5] Loading spots …")
@@ -357,8 +486,28 @@ def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int) -> None:
 
     # ── 3. Cluster metadata + gene labels ─────────────────────────────────────
     print("[3/5] Loading cluster labels …")
-    cluster_meta = _load_cluster_meta(pw_ds)
+    if legacy:
+        cluster_meta = _load_cluster_meta_legacy(mouse_id)
+    else:
+        cluster_meta = _load_cluster_meta(pw_ds)
     gene_labels  = _build_gene_labels(mixed_spots)
+
+    # Slim spot tables to only the columns needed downstream:
+    #   mixed_spots    → cell_id + mixed_gene  (raw_chan_col)
+    #   unmixed tables → cell_id + unmixed_gene (unmixed_chan_col)
+    # This must happen AFTER gene_labels is built (needs round/chan columns).
+    mixed_spots         = mixed_spots[["cell_id", "mixed_gene"]].copy()
+    unmixed_spots_all   = unmixed_spots_all[["cell_id", "unmixed_gene"]].copy()
+    unmixed_spots_valid = unmixed_spots_valid[["cell_id", "unmixed_gene"]].copy()
+
+    # Cast to memory-efficient dtypes.  Categorical stores one int8 code per
+    # row instead of a Python string object (~68 bytes/row), reducing each
+    # gene column from several GB to tens of MB.
+    for _df in (mixed_spots, unmixed_spots_all, unmixed_spots_valid):
+        _df["cell_id"] = _df["cell_id"].astype("int32")
+        _gene_col = "mixed_gene" if "mixed_gene" in _df.columns else "unmixed_gene"
+        _df[_gene_col] = _df[_gene_col].astype("category")
+    gc.collect()
 
     # ── 4. ABC Atlas reference (loaded once, shared by both runs) ─────────────
     print("[4/5] Loading V1 MERFISH reference …")
@@ -382,14 +531,27 @@ def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int) -> None:
         label_level      = label_level,
     )
 
-    # ── 5. Run comparison twice ───────────────────────────────────────────────
-    print("[5/5] Running comparisons …")
+    # ── 5. Pre-aggregate spot tables → cell × gene count matrices ─────────────
+    # _preaggregate_spots uses groupby (not pd.crosstab / add_gene_column) so
+    # Categorical columns are never expanded to Python object strings, avoiding
+    # the ~70 byte/row spike that caused OOM in the previous approach.
+    print("[5/6] Pre-aggregating spot tables …")
+    _shared_genes        = sorted(set(hcr_genes) & set(ref_counts_filt.columns))
+    raw_counts           = _preaggregate_spots(mixed_spots,        "mixed_gene",   cluster_meta.index, _shared_genes)
+    unmixed_counts_all   = _preaggregate_spots(unmixed_spots_all,  "unmixed_gene", cluster_meta.index, _shared_genes)
+    unmixed_counts_valid = _preaggregate_spots(unmixed_spots_valid, "unmixed_gene", cluster_meta.index, _shared_genes)
+    print(f"  Count matrix shape: {raw_counts.shape}  (cells × shared genes)")
+    del mixed_spots          # replaced by raw_counts; spot table no longer needed
+    gc.collect()
+
+    # ── 6. Run comparison twice ──────────────────────────────────────────────
+    print("[6/6] Running comparisons …")
 
     atlas_compare_dir = output_dir / "atlas_compare"
 
     _shared = dict(
-        mouse_id        = mouse_id,
-        mixed_spots     = mixed_spots,
+        mouse_id        = csv_mouse_id,
+        raw_counts      = raw_counts,
         cluster_meta    = cluster_meta,
         gene_labels     = gene_labels,
         ref_counts_filt = ref_counts_filt,
@@ -401,21 +563,27 @@ def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int) -> None:
         label                = "all unmixed spots",
         spot_filter          = "all",
         unmixed_spots        = unmixed_spots_all,
+        unmixed_counts       = unmixed_counts_all,
         unmixed_spots_valid  = unmixed_spots_valid,
         output_dir           = atlas_compare_dir / "all_unmixed",
         **_shared,
     )
 
+    # Free all-unmixed structures before the second run — not used again.
+    del unmixed_spots_all, unmixed_counts_all
+    gc.collect()
+
     _run_one(
-        label         = "valid unmixed spots only",
-        spot_filter   = "valid",
-        unmixed_spots = unmixed_spots_valid,
-        output_dir    = atlas_compare_dir / "valid_unmixed",
+        label          = "valid unmixed spots only",
+        spot_filter    = "valid",
+        unmixed_spots  = unmixed_spots_valid,
+        unmixed_counts = unmixed_counts_valid,
+        output_dir     = atlas_compare_dir / "valid_unmixed",
         **_shared,
     )
 
     print(f"\n{'='*60}")
-    print(f"All done for mouse {mouse_id}.")
+    print(f"All done for mouse {mouse_id}{' (legacy)' if legacy else ''}.")
     print(f"  all_unmixed/   → {atlas_compare_dir / 'all_unmixed'}")
     print(f"  valid_unmixed/ → {atlas_compare_dir / 'valid_unmixed'}")
     print(f"{'='*60}")
@@ -449,16 +617,23 @@ def _parse_args():
         "--dpi", type=int, default=150,
         help="Figure resolution in dots per inch.",
     )
+    parser.add_argument(
+        "--legacy", action="store_true", default=False,
+        help="Use the original HCRDataset instead of the pairwise unmixing dataset. "
+             "Mouse IDs in output CSVs will be suffixed with '-legacy'. "
+             "Output defaults to scratch/ref_atlas_validation/<mouse-id>-legacy.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
 
+    default_subdir = f"{args.mouse_id}-legacy" if args.legacy else args.mouse_id
     out = (
         Path(args.output_dir)
         if args.output_dir is not None
-        else SCRATCH_BASE / args.mouse_id
+        else SCRATCH_BASE / default_subdir
     )
 
     run(
@@ -466,4 +641,5 @@ if __name__ == "__main__":
         output_dir  = out,
         label_level = args.label_level,
         dpi         = args.dpi,
+        legacy      = args.legacy,
     )

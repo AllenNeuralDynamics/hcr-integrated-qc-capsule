@@ -578,8 +578,8 @@ def reference_weighted_expected_expression(
 
 
 def raw_unmixed_reference_comparison(
-    raw_spots: pd.DataFrame,
-    unmixed_spots: pd.DataFrame,
+    raw_spots: Optional[pd.DataFrame],
+    unmixed_spots: Optional[pd.DataFrame],
     cell_meta: pd.DataFrame,
     group_col: str,
     ref_counts: pd.DataFrame,
@@ -592,6 +592,8 @@ def raw_unmixed_reference_comparison(
     matching_source: str = "unmixed",
     pseudocount: float = 0.1,
     scale: float = 10_000,
+    precomputed_raw_counts: Optional[pd.DataFrame] = None,
+    precomputed_unmixed_counts: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compare raw and unmixed group expression to a matched reference subtype.
@@ -612,8 +614,12 @@ def raw_unmixed_reference_comparison(
     Parameters
     ----------
     raw_spots, unmixed_spots:
-        Spot tables with columns `cell_id`, `x`, `y`, `z` and the
-        respective channel column.
+        Spot tables.  Pass ``None`` when *precomputed_raw_counts* and
+        *precomputed_unmixed_counts* are supplied.
+    precomputed_raw_counts, precomputed_unmixed_counts:
+        Optional pre-aggregated cell \u00d7 gene count matrices.  When provided
+        the spot tables are not used for count-matrix construction and genes
+        are derived from the matrix columns instead of the spot tables.
     cell_meta:
         Cell metadata indexed by cell_id or containing a `cell_id` column.
     group_col:
@@ -654,35 +660,47 @@ def raw_unmixed_reference_comparison(
     cell_ids = cell_meta.index
 
     if genes is None:
-        if chan_to_gene is None:
+        if precomputed_raw_counts is not None and precomputed_unmixed_counts is not None:
+            genes = sorted(
+                set(precomputed_raw_counts.columns)
+                & set(precomputed_unmixed_counts.columns)
+                & set(ref_counts.columns)
+            )
+        elif chan_to_gene is None:
             raw_genes = set(raw_spots[raw_chan_col].astype(str))
             unmixed_genes = set(unmixed_spots[unmixed_chan_col].astype(str))
+            genes = sorted(raw_genes & unmixed_genes & set(ref_counts.columns))
         else:
             raw_genes = set(raw_spots[raw_chan_col].map(chan_to_gene).dropna())
             unmixed_genes = set(unmixed_spots[unmixed_chan_col].map(chan_to_gene).dropna())
-
-        genes = sorted(raw_genes & unmixed_genes & set(ref_counts.columns))
+            genes = sorted(raw_genes & unmixed_genes & set(ref_counts.columns))
     else:
         genes = [g for g in genes if g in ref_counts.columns]
 
     if len(genes) == 0:
         raise ValueError("No shared genes between observed spots and reference.")
 
-    raw_counts = spots_to_cell_gene_counts(
-        raw_spots,
-        cell_ids=cell_ids,
-        genes=genes,
-        chan_to_gene=chan_to_gene,
-        chan_col=raw_chan_col,
-    )
+    if precomputed_raw_counts is not None:
+        raw_counts = precomputed_raw_counts.reindex(index=cell_ids, columns=genes, fill_value=0)
+    else:
+        raw_counts = spots_to_cell_gene_counts(
+            raw_spots,
+            cell_ids=cell_ids,
+            genes=genes,
+            chan_to_gene=chan_to_gene,
+            chan_col=raw_chan_col,
+        )
 
-    unmixed_counts = spots_to_cell_gene_counts(
-        unmixed_spots,
-        cell_ids=cell_ids,
-        genes=genes,
-        chan_to_gene=chan_to_gene,
-        chan_col=unmixed_chan_col,
-    )
+    if precomputed_unmixed_counts is not None:
+        unmixed_counts = precomputed_unmixed_counts.reindex(index=cell_ids, columns=genes, fill_value=0)
+    else:
+        unmixed_counts = spots_to_cell_gene_counts(
+            unmixed_spots,
+            cell_ids=cell_ids,
+            genes=genes,
+            chan_to_gene=chan_to_gene,
+            chan_col=unmixed_chan_col,
+        )
 
     raw_group_expr = group_mean_expression(raw_counts, cell_meta, group_col, scale=scale)
     unmixed_group_expr = group_mean_expression(unmixed_counts, cell_meta, group_col, scale=scale)
