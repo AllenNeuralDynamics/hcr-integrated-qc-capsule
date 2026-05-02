@@ -316,36 +316,6 @@ def _load_abc_reference(hcr_genes, v1_merfish_cells, label_level: str):
 
 
 # ---------------------------------------------------------------------------
-# Spot pre-aggregation helper
-# ---------------------------------------------------------------------------
-
-def _preaggregate_spots(
-    spots: pd.DataFrame,
-    gene_col: str,
-    cell_ids,
-    genes: list,
-) -> pd.DataFrame:
-    """Aggregate a spot table to a cell × gene count matrix.
-
-    Uses ``groupby`` rather than ``pd.crosstab`` so that Categorical gene
-    columns are never expanded to Python object strings.  Spots are
-    pre-filtered to *cell_ids* and *genes* before aggregation, further
-    reducing working memory.
-
-    Returns
-    -------
-    pd.DataFrame
-        Shape ``(len(cell_ids), len(genes))``, integer counts, zero-filled.
-    """
-    cell_id_set = set(cell_ids)
-    gene_set    = set(genes)
-    mask        = spots["cell_id"].isin(cell_id_set) & spots[gene_col].isin(gene_set)
-    s           = spots.loc[mask, ["cell_id", gene_col]]
-    counts      = s.groupby(["cell_id", gene_col]).size().unstack(fill_value=0)
-    return counts.reindex(index=cell_ids, columns=genes, fill_value=0)
-
-
-# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -353,9 +323,8 @@ def _run_one(
     label: str,
     spot_filter: str,
     mouse_id: str,
-    raw_counts: pd.DataFrame,
+    mixed_spots: pd.DataFrame,
     unmixed_spots: pd.DataFrame,
-    unmixed_counts: pd.DataFrame,
     cluster_meta: pd.DataFrame,
     gene_labels: dict,
     ref_counts_filt: pd.DataFrame,
@@ -373,13 +342,9 @@ def _run_one(
         Used as a grouping key when CSVs from multiple mice are concatenated.
     mouse_id:
         Written into saved CSVs so rows are identifiable after concatenation.
-    raw_counts:
-        Pre-aggregated raw (mixed) cell × gene count matrix.
-    unmixed_counts:
-        Pre-aggregated unmixed cell × gene count matrix for this run.
     unmixed_spots_valid:
-        Optional valid-only unmixed spots DataFrame.  Still required for the
-        cell × gene heatmap (``12_cxg_clusters_valid.png``).
+        Optional valid-only unmixed spots.  When provided a second CXG figure
+        (``12_cxg_clusters_valid.png``) is saved alongside the all-spots one.
     """
     print(f"\n{'─'*60}")
     print(f"  Run: {label}")
@@ -390,17 +355,15 @@ def _run_one(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     comparison, cluster_matches = atlas_compare.raw_unmixed_reference_comparison(
-        raw_spots                  = None,
-        unmixed_spots              = None,
-        cell_meta                  = cluster_meta,
-        group_col                  = "cluster_label",
-        ref_counts                 = ref_counts_filt,
-        ref_labels                 = ref_labels_filt,
-        raw_chan_col               = "mixed_gene",
-        unmixed_chan_col           = "unmixed_gene",
-        matching_source            = "unmixed",
-        precomputed_raw_counts     = raw_counts,
-        precomputed_unmixed_counts = unmixed_counts,
+        raw_spots        = mixed_spots,
+        unmixed_spots    = unmixed_spots,
+        cell_meta        = cluster_meta,
+        group_col        = "cluster_label",
+        ref_counts       = ref_counts_filt,
+        ref_labels       = ref_labels_filt,
+        raw_chan_col     = "mixed_gene",
+        unmixed_chan_col = "unmixed_gene",
+        matching_source  = "unmixed",
     )
 
     print("Cluster → reference matches:")
@@ -499,14 +462,6 @@ def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int, legacy: boo
     mixed_spots         = mixed_spots[["cell_id", "mixed_gene"]].copy()
     unmixed_spots_all   = unmixed_spots_all[["cell_id", "unmixed_gene"]].copy()
     unmixed_spots_valid = unmixed_spots_valid[["cell_id", "unmixed_gene"]].copy()
-
-    # Cast to memory-efficient dtypes.  Categorical stores one int8 code per
-    # row instead of a Python string object (~68 bytes/row), reducing each
-    # gene column from several GB to tens of MB.
-    for _df in (mixed_spots, unmixed_spots_all, unmixed_spots_valid):
-        _df["cell_id"] = _df["cell_id"].astype("int32")
-        _gene_col = "mixed_gene" if "mixed_gene" in _df.columns else "unmixed_gene"
-        _df[_gene_col] = _df[_gene_col].astype("category")
     gc.collect()
 
     # ── 4. ABC Atlas reference (loaded once, shared by both runs) ─────────────
@@ -531,27 +486,14 @@ def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int, legacy: boo
         label_level      = label_level,
     )
 
-    # ── 5. Pre-aggregate spot tables → cell × gene count matrices ─────────────
-    # _preaggregate_spots uses groupby (not pd.crosstab / add_gene_column) so
-    # Categorical columns are never expanded to Python object strings, avoiding
-    # the ~70 byte/row spike that caused OOM in the previous approach.
-    print("[5/6] Pre-aggregating spot tables …")
-    _shared_genes        = sorted(set(hcr_genes) & set(ref_counts_filt.columns))
-    raw_counts           = _preaggregate_spots(mixed_spots,        "mixed_gene",   cluster_meta.index, _shared_genes)
-    unmixed_counts_all   = _preaggregate_spots(unmixed_spots_all,  "unmixed_gene", cluster_meta.index, _shared_genes)
-    unmixed_counts_valid = _preaggregate_spots(unmixed_spots_valid, "unmixed_gene", cluster_meta.index, _shared_genes)
-    print(f"  Count matrix shape: {raw_counts.shape}  (cells × shared genes)")
-    del mixed_spots          # replaced by raw_counts; spot table no longer needed
-    gc.collect()
-
-    # ── 6. Run comparison twice ──────────────────────────────────────────────
-    print("[6/6] Running comparisons …")
+    # ── 5. Run comparison twice ───────────────────────────────────────────────
+    print("[5/5] Running comparisons …")
 
     atlas_compare_dir = output_dir / "atlas_compare"
 
     _shared = dict(
         mouse_id        = csv_mouse_id,
-        raw_counts      = raw_counts,
+        mixed_spots     = mixed_spots,
         cluster_meta    = cluster_meta,
         gene_labels     = gene_labels,
         ref_counts_filt = ref_counts_filt,
@@ -563,22 +505,20 @@ def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int, legacy: boo
         label                = "all unmixed spots",
         spot_filter          = "all",
         unmixed_spots        = unmixed_spots_all,
-        unmixed_counts       = unmixed_counts_all,
         unmixed_spots_valid  = unmixed_spots_valid,
         output_dir           = atlas_compare_dir / "all_unmixed",
         **_shared,
     )
 
-    # Free all-unmixed structures before the second run — not used again.
-    del unmixed_spots_all, unmixed_counts_all
+    # Free the all-unmixed table before the second run — it is not used again.
+    del unmixed_spots_all
     gc.collect()
 
     _run_one(
-        label          = "valid unmixed spots only",
-        spot_filter    = "valid",
-        unmixed_spots  = unmixed_spots_valid,
-        unmixed_counts = unmixed_counts_valid,
-        output_dir     = atlas_compare_dir / "valid_unmixed",
+        label         = "valid unmixed spots only",
+        spot_filter   = "valid",
+        unmixed_spots = unmixed_spots_valid,
+        output_dir    = atlas_compare_dir / "valid_unmixed",
         **_shared,
     )
 
