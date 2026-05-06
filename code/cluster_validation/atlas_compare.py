@@ -1871,6 +1871,7 @@ def plot_multi_mouse_improvement_by_gene(
     spot_filter: Optional[str] = None,
     figsize: Optional[Tuple] = None,
     title: str = "Mean unmixing improvement by gene (all mice)",
+    show_individual: bool = True,
 ) -> "plt.Figure":
     """
     Horizontal bar chart of mean improvement per gene across all mice.
@@ -1889,6 +1890,9 @@ def plot_multi_mouse_improvement_by_gene(
         Override figure size.
     title:
         Figure suptitle.
+    show_individual:
+        If ``False``, skip the per-mouse jitter dots and show only the mean
+        bars.
     """
     import re as _re
 
@@ -1918,14 +1922,15 @@ def plot_multi_mouse_improvement_by_gene(
         colors_bar = ["#d62728" if v < 0 else "#2ca02c" for v in means]
         ax.barh(genes, means, color=colors_bar, alpha=0.65, zorder=2)
 
-        for mouse in mice:
-            msub = sub[sub["mouse_id"].astype(str) == mouse]
-            gene_vals = msub.groupby("gene")["improvement"].mean().reindex(genes)
-            y_jitter  = rng.uniform(-0.25, 0.25, size=len(genes))
-            ax.scatter(
-                gene_vals, __import__("numpy").arange(len(genes)) + y_jitter,
-                color=colors[mouse], s=18, zorder=3, alpha=0.85, label=str(mouse),
-            )
+        if show_individual:
+            for mouse in mice:
+                msub = sub[sub["mouse_id"].astype(str) == mouse]
+                gene_vals = msub.groupby("gene")["improvement"].mean().reindex(genes)
+                y_jitter  = rng.uniform(-0.25, 0.25, size=len(genes))
+                ax.scatter(
+                    gene_vals, __import__("numpy").arange(len(genes)) + y_jitter,
+                    color=colors[mouse], s=18, zorder=3, alpha=0.85, label=str(mouse),
+                )
 
         ax.axvline(0, color="black", linewidth=0.8)
         ax.set_yticks(range(len(genes)))
@@ -1946,6 +1951,7 @@ def plot_multi_mouse_match_scores(
     spot_filter: Optional[str] = None,
     figsize: Optional[Tuple] = None,
     title: str = "Cluster → reference match scores (all mice)",
+    show_individual: bool = True,
 ) -> "plt.Figure":
     """
     Strip + box plot of cluster-to-reference cosine match scores per mouse.
@@ -1964,6 +1970,9 @@ def plot_multi_mouse_match_scores(
         Override figure size.
     title:
         Figure suptitle.
+    show_individual:
+        If ``False``, skip the per-cluster jitter dots and show only the
+        box plots.
     """
     import re as _re
     import numpy as _np
@@ -1992,8 +2001,9 @@ def plot_multi_mouse_match_scores(
                             medianprops=dict(color="black", linewidth=1.5),
                             whiskerprops=dict(linewidth=1), capprops=dict(linewidth=1),
                             flierprops=dict(marker=""), showfliers=False)
-            jitter = rng.uniform(-0.15, 0.15, size=len(vals))
-            ax.scatter(xi + jitter, vals, color=colors[mouse], s=22, alpha=0.75, zorder=3)
+            if show_individual:
+                jitter = rng.uniform(-0.15, 0.15, size=len(vals))
+                ax.scatter(xi + jitter, vals, color=colors[mouse], s=22, alpha=0.75, zorder=3)
 
         ax.set_xticks(range(len(mice)))
         ax.set_xticklabels(mice, rotation=30, ha="right")
@@ -2013,6 +2023,7 @@ def plot_multi_mouse_error_ecdf(
     spot_filter: Optional[str] = None,
     figsize: Optional[Tuple] = None,
     title: str = "ECDF of absolute log2 O/E error: raw vs unmixed (pooled mice)",
+    show_individual: bool = True,
 ) -> "plt.Figure":
     """
     ECDF of raw vs unmixed absolute log2 O/E error, pooled across all mice.
@@ -2033,6 +2044,9 @@ def plot_multi_mouse_error_ecdf(
         Override figure size.
     title:
         Figure suptitle.
+    show_individual:
+        If ``False``, skip the thin per-mouse lines and show only the bold
+        pooled curves.
     """
     import re as _re
     import numpy as _np
@@ -2055,14 +2069,15 @@ def plot_multi_mouse_error_ecdf(
         sub = df[df["spot_filter"] == filt]
 
         # Thin per-mouse lines for variability context
-        for mouse in mice:
-            msub = sub[sub["mouse_id"].astype(str) == mouse]
-            for col, color in [("raw_abs_error", RAW_COLOR), ("unmixed_abs_error", UNMIX_COLOR)]:
-                vals = _np.sort(msub[col].dropna().values)
-                if len(vals) == 0:
-                    continue
-                ecdf_y = _np.arange(1, len(vals) + 1) / len(vals)
-                ax.plot(vals, ecdf_y, color=color, linewidth=0.7, alpha=0.25)
+        if show_individual:
+            for mouse in mice:
+                msub = sub[sub["mouse_id"].astype(str) == mouse]
+                for col, color in [("raw_abs_error", RAW_COLOR), ("unmixed_abs_error", UNMIX_COLOR)]:
+                    vals = _np.sort(msub[col].dropna().values)
+                    if len(vals) == 0:
+                        continue
+                    ecdf_y = _np.arange(1, len(vals) + 1) / len(vals)
+                    ax.plot(vals, ecdf_y, color=color, linewidth=0.7, alpha=0.25)
 
         # Bold pooled curves
         for col, color, ls in [
@@ -2151,6 +2166,119 @@ def plot_multi_mouse_filter_ecdf(
         plt.Line2D([0], [0], color="gray", linestyle="-",  linewidth=1.5, label="unmixed"),
     ]
     ax.legend(handles=filter_handles + style_handles, title="filter / condition", fontsize=9)
+    fig.suptitle(title, y=1.02)
+    plt.tight_layout()
+    return fig
+
+
+@_saveable_plot()
+def plot_legacy_vs_new_ecdf(
+    comparison: pd.DataFrame,
+    spot_filter: str = "valid",
+    figsize: Optional[Tuple] = None,
+    title: str = "ECDF of absolute log2 O/E error: raw vs new vs legacy",
+    show_individual: bool = True,
+) -> "plt.Figure":
+    """
+    Single-panel ECDF comparing raw (shared), new unmixed, and legacy unmixed.
+
+    One bold curve each for:
+      - raw (gray dashed)  — taken from the "new" dataset to avoid duplication
+      - new unmixed (blue solid)
+      - legacy unmixed (orange solid)
+
+    Thin per-mouse lines are drawn at low opacity when ``show_individual=True``.
+
+    Parameters
+    ----------
+    comparison:
+        Annotated comparison DataFrame.  Must have ``dataset`` (``"new"`` /
+        ``"legacy"``), ``base_mouse_id``, ``spot_filter``, ``raw_abs_error``,
+        ``unmixed_abs_error``.  Typically ``comp_ann`` from the notebook.
+    spot_filter:
+        Which ``spot_filter`` value to display (e.g. ``"valid"`` or ``"all"``).
+    figsize:
+        Override figure size.
+    title:
+        Figure suptitle.
+    show_individual:
+        If ``False``, skip the thin per-mouse lines.
+    """
+    import re as _re
+    import numpy as _np
+
+    RAW_COLOR    = "#7f7f7f"
+    NEW_COLOR    = "#1f77b4"
+    LEGACY_COLOR = "#ff7f0e"
+
+    df = comparison.copy()
+    df = df[df["spot_filter"] == spot_filter]
+
+    if "dataset" not in df.columns or "base_mouse_id" not in df.columns:
+        raise ValueError(
+            "comparison must have 'dataset' and 'base_mouse_id' columns. "
+            "Pass comp_ann (the annotated DataFrame), not comp_plot."
+        )
+
+    mice = sorted(
+        df["base_mouse_id"].astype(str).unique(),
+        key=lambda s: [int(t) if t.isdigit() else t for t in _re.split(r"(\d+)", s)],
+    )
+
+    fw, fh = figsize or (6.5, 4.5)
+    fig, ax = plt.subplots(figsize=(fw, fh))
+
+    # ── thin per-mouse lines ──────────────────────────────────────────────────
+    if show_individual:
+        new_sub    = df[df["dataset"] == "new"]
+        legacy_sub = df[df["dataset"] == "legacy"]
+        for mouse in mice:
+            # raw (from new dataset only)
+            msub = new_sub[new_sub["base_mouse_id"].astype(str) == mouse]
+            vals = _np.sort(msub["raw_abs_error"].dropna().values)
+            if len(vals):
+                ax.plot(vals, _np.arange(1, len(vals) + 1) / len(vals),
+                        color=RAW_COLOR, linewidth=0.7, alpha=0.25)
+            # new unmixed
+            vals = _np.sort(msub["unmixed_abs_error"].dropna().values)
+            if len(vals):
+                ax.plot(vals, _np.arange(1, len(vals) + 1) / len(vals),
+                        color=NEW_COLOR, linewidth=0.7, alpha=0.25)
+            # legacy unmixed
+            msub_leg = legacy_sub[legacy_sub["base_mouse_id"].astype(str) == mouse]
+            vals = _np.sort(msub_leg["unmixed_abs_error"].dropna().values)
+            if len(vals):
+                ax.plot(vals, _np.arange(1, len(vals) + 1) / len(vals),
+                        color=LEGACY_COLOR, linewidth=0.7, alpha=0.25)
+
+    # ── bold pooled curves ────────────────────────────────────────────────────
+    new_sub    = df[df["dataset"] == "new"]
+    legacy_sub = df[df["dataset"] == "legacy"]
+
+    for vals_arr, color, ls, lw in [
+        (new_sub["raw_abs_error"].dropna().values,       RAW_COLOR,    "--", 2.2),
+        (new_sub["unmixed_abs_error"].dropna().values,   NEW_COLOR,    "-",  2.2),
+        (legacy_sub["unmixed_abs_error"].dropna().values, LEGACY_COLOR, "-",  2.2),
+    ]:
+        vals = _np.sort(vals_arr)
+        if len(vals) == 0:
+            continue
+        ax.plot(vals, _np.arange(1, len(vals) + 1) / len(vals),
+                color=color, linestyle=ls, linewidth=lw)
+
+    ax.set_xlabel("Absolute log2 O/E error")
+    ax.set_ylabel("Cumulative proportion")
+    ax.set_xlim(0, 5)
+    ax.set_ylim(0, 1.05)
+    ax.set_title(f"spot_filter = {spot_filter}")
+    ax.axhline(0.5, color="gray", linewidth=0.7, linestyle=":")
+
+    handles = [
+        plt.Line2D([0], [0], color=RAW_COLOR,    linestyle="--", linewidth=2, label="mixed"),
+        plt.Line2D([0], [0], color=NEW_COLOR,    linestyle="-",  linewidth=2, label="unmixed (new)"),
+        plt.Line2D([0], [0], color=LEGACY_COLOR, linestyle="-",  linewidth=2, label="unmixed (legacy)"),
+    ]
+    ax.legend(handles=handles, fontsize=14)
     fig.suptitle(title, y=1.02)
     plt.tight_layout()
     return fig
