@@ -229,7 +229,7 @@ def interactive_single_cell_unmixing_plotly(
 	chan_order,
 	*,
 	spot_size: float = 8,
-	metric_options: Iterable[str] = ("r", "dist"),
+	metric_options: Iterable[str] = ("r", "dist", "d_assign_neighbor_ratio_1", "d_assign_neighbor_ratio_2", "dye_line_dist_ratio", "intensity_assigned_chan"),
 	cmap_options: Sequence[str] = DEFAULT_CMAPS_PLOTLY,
 ):
 	"""Interactive Plotly version with dropdowns for metric and colormap."""
@@ -271,3 +271,71 @@ def interactive_single_cell_unmixing_plotly(
 	widget = widgets.VBox([widgets.HBox([metric_dropdown, cmap_dropdown]), out])
 	_render()
 	return widget
+
+
+def add_intensity_assigned_chan(
+	df,
+	assigned_col: str | None = None,
+	output_col: str = "intensity_assigned_chan",
+):
+	"""Add a derived intensity column for each spot's assigned channel.
+
+	For each row, this reads the intensity from the channel-specific column
+	``chan_<assigned>_intensity`` where ``<assigned>`` comes from the assigned
+	channel column.
+
+	Parameters
+	----------
+	df : pd.DataFrame
+		Spot table containing channel intensity columns such as
+		``chan_488_intensity``.
+	assigned_col : str or None
+		Column to use for assigned channel. If ``None``, uses ``unmixed_chan``
+		when present, otherwise ``chan``.
+	output_col : str
+		Name of the derived output column.
+
+	Returns
+	-------
+	pd.DataFrame
+		A copy of ``df`` with ``output_col`` added.
+	"""
+	import pandas as pd
+
+	# if assigned_col is None:
+	# 	if "unmixed_chan" in df.columns:
+	# 		assigned_col = "unmixed_chan"
+	# 	elif "chan" in df.columns:
+	# 		assigned_col = "chan"
+	# 	else:
+	# 		raise ValueError(
+	# 			"No assigned channel column found. Expected 'unmixed_chan' or 'chan'."
+	# 		)
+	assigned_col = "chan"
+
+	if assigned_col not in df.columns:
+		raise ValueError(f"Assigned channel column not found: {assigned_col}")
+
+	def _fmt_chan(v):
+		if pd.isna(v):
+			return None
+		s = str(v).strip()
+		if s.endswith(".0"):
+			s = s[:-2]
+		return s
+
+	out = df.copy()
+	assigned = out[assigned_col].map(_fmt_chan)
+	target_cols = assigned.map(lambda c: f"chan_{c}_intensity" if c is not None else None)
+
+	out[output_col] = np.nan
+	for col_name, row_idx in target_cols.groupby(target_cols).groups.items():
+		if col_name is None:
+			continue
+		if col_name in out.columns:
+			out.loc[row_idx, output_col] = pd.to_numeric(
+				out.loc[row_idx, col_name],
+				errors="coerce",
+			)
+
+	return out
