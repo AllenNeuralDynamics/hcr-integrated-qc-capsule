@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import logging
 from pathlib import Path
 from typing import Iterable, Sequence
 import re
@@ -87,6 +88,18 @@ def _temporarily_cache_dataset_loads(dataset):
 		dataset.load_segmentation_mask = orig_load_segmentation_mask
 
 
+@contextmanager
+def _temporarily_set_logger_level(logger_name: str, level: int):
+	"""Temporarily override a logger level and restore it on exit."""
+	logger = logging.getLogger(logger_name)
+	old_level = logger.level
+	logger.setLevel(level)
+	try:
+		yield
+	finally:
+		logger.setLevel(old_level)
+
+
 def batch_save_single_cell_unmixing_mg2(
 	m_cell,
 	u_cell,
@@ -158,41 +171,43 @@ def batch_save_single_cell_unmixing_mg2(
 
 	saved_paths: list[Path] = []
 	with _temporarily_cache_dataset_loads(dataset):
-		for metric_col in metrics:
-			metric_slug = _sanitize_for_filename(metric_col)
-			out_path = output_path / f"{filename_prefix}_metric_{metric_slug}.{file_ext}"
+		# Suppress noisy Matplotlib limits/aspect warning during batch export.
+		with _temporarily_set_logger_level("matplotlib.axes._base", logging.ERROR):
+			for metric_col in metrics:
+				metric_slug = _sanitize_for_filename(metric_col)
+				out_path = output_path / f"{filename_prefix}_metric_{metric_slug}.{file_ext}"
 
-			fig = fig_single_cell_unmixing_mg2(
-				m_cell,
-				u_cell,
-				cell_id=cell_id,
-				round_key=round_key,
-				chan_order=chan_order,
-				chan_colors=chan_colors,
-				dataset=dataset,
-				pyramid_level=pyramid_level,
-				img_fixed_vmin=img_fixed_vmin,
-				img_fixed_vmax=img_fixed_vmax,
-				spot_size=spot_size,
-				fast_plot=fast_plot,
-				top_row_mask_outlines=top_row_mask_outlines,
-				metric_col=metric_col,
-				cmap=cmap,
-				vmin=vmin,
-				vmax=vmax,
-			)
-			fig.savefig(
-				out_path,
-				dpi=dpi,
-				bbox_inches=bbox_inches,
-				facecolor=facecolor,
-				transparent=transparent,
-			)
-			saved_paths.append(out_path)
-			if close_figures:
-				plt.close(fig)
-			if verbose:
-				print(f"Saved {out_path}")
+				fig = fig_single_cell_unmixing_mg2(
+					m_cell,
+					u_cell,
+					cell_id=cell_id,
+					round_key=round_key,
+					chan_order=chan_order,
+					chan_colors=chan_colors,
+					dataset=dataset,
+					pyramid_level=pyramid_level,
+					img_fixed_vmin=img_fixed_vmin,
+					img_fixed_vmax=img_fixed_vmax,
+					spot_size=spot_size,
+					fast_plot=fast_plot,
+					top_row_mask_outlines=top_row_mask_outlines,
+					metric_col=metric_col,
+					cmap=cmap,
+					vmin=vmin,
+					vmax=vmax,
+				)
+				fig.savefig(
+					out_path,
+					dpi=dpi,
+					bbox_inches=bbox_inches,
+					facecolor=facecolor,
+					transparent=transparent,
+				)
+				saved_paths.append(out_path)
+				if close_figures:
+					plt.close(fig)
+				if verbose:
+					print(f"Saved {out_path}")
 
 	return saved_paths
 
