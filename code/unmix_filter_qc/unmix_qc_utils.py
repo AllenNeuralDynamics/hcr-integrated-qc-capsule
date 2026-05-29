@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterable, Sequence
+import re
 
 import ipywidgets as widgets
+import matplotlib.pyplot as plt
 import numpy as np
 from IPython.display import display
 from plotly.subplots import make_subplots
@@ -32,6 +36,165 @@ DEFAULT_CMAPS_PLOTLY: Sequence[str] = (
 	"Turbo",
 	"RdBu",
 )
+
+
+def _sanitize_for_filename(value: object) -> str:
+	"""Return a filesystem-friendly string for output filenames."""
+	text = str(value).strip()
+	text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+	text = re.sub(r"_+", "_", text)
+	return text.strip("_.") or "value"
+
+
+@contextmanager
+def _temporarily_cache_dataset_loads(dataset):
+	"""Temporarily memoize heavy dataset image/mask loaders for one batch run.
+
+	This caches calls to ``dataset.load_zarr_channel`` and
+	``dataset.load_segmentation_mask`` on the dataset instance passed in, then
+	restores the original methods on exit.
+	"""
+	if dataset is None:
+		yield
+		return
+
+	orig_load_zarr_channel = dataset.load_zarr_channel
+	orig_load_segmentation_mask = dataset.load_segmentation_mask
+	zarr_cache = {}
+	seg_cache = {}
+
+	def _freeze_kwargs(kwargs):
+		return tuple(sorted(kwargs.items()))
+
+	def cached_load_zarr_channel(*args, **kwargs):
+		key = (args, _freeze_kwargs(kwargs))
+		if key not in zarr_cache:
+			zarr_cache[key] = orig_load_zarr_channel(*args, **kwargs)
+		return zarr_cache[key]
+
+	def cached_load_segmentation_mask(*args, **kwargs):
+		key = (args, _freeze_kwargs(kwargs))
+		if key not in seg_cache:
+			seg_cache[key] = orig_load_segmentation_mask(*args, **kwargs)
+		return seg_cache[key]
+
+	dataset.load_zarr_channel = cached_load_zarr_channel
+	dataset.load_segmentation_mask = cached_load_segmentation_mask
+	try:
+		yield
+	finally:
+		dataset.load_zarr_channel = orig_load_zarr_channel
+		dataset.load_segmentation_mask = orig_load_segmentation_mask
+
+
+def batch_save_single_cell_unmixing_mg2(
+	m_cell,
+	u_cell,
+	cell_id,
+	round_key,
+	dataset,
+	chan_order,
+	chan_colors,
+	metric_cols: Iterable[str],
+	*,
+	output_dir: str | Path,
+	filename_prefix: str | None = None,
+	file_ext: str = "png",
+	dpi: int = 150,
+	bbox_inches: str = "tight",
+	facecolor: str = "white",
+	transparent: bool = False,
+	pyramid_level: str = "0",
+	img_fixed_vmin: float = 90,
+	img_fixed_vmax: float = 1200,
+	spot_size: float = 30,
+	fast_plot: bool = False,
+	top_row_mask_outlines: bool = True,
+	cmap: str = "viridis",
+	vmin: float | None = None,
+	vmax: float | None = None,
+	close_figures: bool = True,
+	verbose: bool = True,
+):
+	"""Save one ``fig_single_cell_unmixing_mg2`` image per metric.
+
+	The figure construction remains identical to the interactive single-metric
+	path, but expensive dataset loaders are memoized for the duration of the
+	batch so repeated zarr and segmentation opens are avoided.
+
+	Parameters
+	----------
+	m_cell, u_cell
+		Spot tables for a single cell and round.
+	cell_id, round_key, dataset, chan_order, chan_colors
+		Forwarded directly to ``fig_single_cell_unmixing_mg2``.
+	metric_cols
+		Iterable of metric column names to render.
+	output_dir
+		Directory where images are written.
+	filename_prefix
+		Optional prefix for saved files. Defaults to ``cell_<id>_<round>``.
+	file_ext
+		Image extension such as ``png`` or ``pdf``.
+	close_figures
+		Close figures after save to avoid memory growth during large batches.
+
+	Returns
+	-------
+	list[pathlib.Path]
+		Saved file paths, in metric order.
+	"""
+	metrics = list(metric_cols)
+	if not metrics:
+		raise ValueError("metric_cols must contain at least one metric name")
+
+	output_path = Path(output_dir)
+	output_path.mkdir(parents=True, exist_ok=True)
+
+	if filename_prefix is None:
+		filename_prefix = f"cell_{cell_id}_{round_key}"
+	filename_prefix = _sanitize_for_filename(filename_prefix)
+	file_ext = file_ext.lstrip(".")
+
+	saved_paths: list[Path] = []
+	with _temporarily_cache_dataset_loads(dataset):
+		for metric_col in metrics:
+			metric_slug = _sanitize_for_filename(metric_col)
+			out_path = output_path / f"{filename_prefix}_metric_{metric_slug}.{file_ext}"
+
+			fig = fig_single_cell_unmixing_mg2(
+				m_cell,
+				u_cell,
+				cell_id=cell_id,
+				round_key=round_key,
+				chan_order=chan_order,
+				chan_colors=chan_colors,
+				dataset=dataset,
+				pyramid_level=pyramid_level,
+				img_fixed_vmin=img_fixed_vmin,
+				img_fixed_vmax=img_fixed_vmax,
+				spot_size=spot_size,
+				fast_plot=fast_plot,
+				top_row_mask_outlines=top_row_mask_outlines,
+				metric_col=metric_col,
+				cmap=cmap,
+				vmin=vmin,
+				vmax=vmax,
+			)
+			fig.savefig(
+				out_path,
+				dpi=dpi,
+				bbox_inches=bbox_inches,
+				facecolor=facecolor,
+				transparent=transparent,
+			)
+			saved_paths.append(out_path)
+			if close_figures:
+				plt.close(fig)
+			if verbose:
+				print(f"Saved {out_path}")
+
+	return saved_paths
 
 
 def interactive_single_cell_unmixing_mg2(
