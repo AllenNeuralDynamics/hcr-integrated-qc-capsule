@@ -237,3 +237,159 @@ def make_filtered_views_for_smartseq(adata: ad.AnnData) -> dict[str, ad.AnnData]
         "inhibitory": base[base.obs["subclass"].isin(_inh_subclasses)].copy(),
         "excitatory": base[base.obs["class"] == "Glutamatergic"].copy(),
     }
+
+
+def cluster_gene_positive_cells(
+    adata: ad.AnnData,
+    gene: str,
+    expression_threshold: float,
+    reference_cluster_col: str = "cluster",
+    n_neighbors_range: list[int] = None,
+    resolution_range: list[float] = None,
+    compute_umap: bool = True,
+) -> tuple[ad.AnnData, dict]:
+    """
+    Filter cells by gene expression threshold and perform Leiden clustering with parameter sweep.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Input AnnData object
+    gene : str
+        Gene name to filter by
+    expression_threshold : float
+        Minimum expression value for filtering
+    reference_cluster_col : str, optional
+        Column name in .obs containing reference clusters for ARI calculation (default: "cluster")
+    n_neighbors_range : list[int], optional
+        Values of n_neighbors to test (default: [5, 10, 15, 20, 30, 40, 50, 60, 80, 100])
+    resolution_range : list[float], optional
+        Resolution values to test (default: [0.3, 0.5, 0.8, 1.0, 1.5])
+    compute_umap : bool, optional
+        Whether to compute UMAP embedding (default: True)
+
+    Returns
+    -------
+    adata_filtered : AnnData
+        Filtered AnnData with Leiden clustering results in .obs['leiden']
+    results_dict : dict
+        Dictionary containing:
+        - 'sweep_df': DataFrame with all parameter combinations and ARI scores
+        - 'best_params': dict with best_n_neighbors, best_resolution, best_ari
+        - 'n_cells': number of cells after filtering
+        - 'n_clusters': number of Leiden clusters found with best parameters
+    """
+    from sklearn.metrics import adjusted_rand_score
+    import pandas as pd
+
+    if gene not in adata.var_names:
+        raise ValueError(f"Gene '{gene}' not found in adata.var_names")
+
+    # Filter cells by gene expression
+    gene_mask = adata[:, gene].X.flatten() > expression_threshold
+    adata_filtered = adata[gene_mask].copy()
+
+    print(f"Filtered to {len(adata_filtered):,} cells with {gene} > {expression_threshold}")
+
+    # Set default parameter ranges
+    if n_neighbors_range is None:
+        n_neighbors_range = [5, 10, 15, 20, 30, 40, 50, 60, 80, 100]
+    if resolution_range is None:
+        resolution_range = [0.3, 0.5, 0.8, 1.0, 1.5]
+
+    # Parameter sweep
+    sweep_results = []
+    for n_neighbors in n_neighbors_range:
+        for resolution in resolution_range:
+            sc.pp.neighbors(adata_filtered, use_rep="X", n_neighbors=n_neighbors)
+            sc.tl.leiden(adata_filtered, resolution=resolution, key_added="leiden_test")
+
+            # Calculate ARI against reference clusters if available
+            if reference_cluster_col in adata_filtered.obs.columns:
+                ari = adjusted_rand_score(
+                    adata_filtered.obs[reference_cluster_col],
+                    adata_filtered.obs["leiden_test"],
+                )
+            else:
+                ari = None
+
+            sweep_results.append({
+                "n_neighbors": n_neighbors,
+                "resolution": resolution,
+                "ari": ari
+            })
+
+    sweep_df = pd.DataFrame(sweep_results).sort_values("ari", ascending=False)
+    best = sweep_df.iloc[0]
+
+    print(f"Best params: n_neighbors={int(best.n_neighbors)}, "
+          f"resolution={best.resolution:.1f}, ARI={best.ari:.3f}")
+
+    # Run final clustering with best parameters
+    best_n_neighbors = int(best.n_neighbors)
+    best_resolution = best.resolution
+
+    sc.pp.neighbors(adata_filtered, use_rep="X", n_neighbors=best_n_neighbors)
+    sc.tl.leiden(adata_filtered, resolution=best_resolution)
+
+    n_leiden_clusters = adata_filtered.obs["leiden"].nunique()
+    print(f"Leiden found {n_leiden_clusters} clusters")
+
+    # Compute UMAP if requested
+    if compute_umap:
+        sc.tl.umap(adata_filtered)
+        print("UMAP computed")
+
+    results_dict = {
+        "sweep_df": sweep_df,
+        "best_params": {
+            "best_n_neighbors": best_n_neighbors,
+            "best_resolution": best_resolution,
+            "best_ari": best.ari,
+        },
+        "n_cells": len(adata_filtered),
+        "n_clusters": n_leiden_clusters,
+    }
+
+    return adata_filtered, results_dict
+
+
+def plot_clustering_sweep_heatmap(
+    sweep_df,
+    metric_col: str = "ari",
+    title: str = None,
+    figsize: tuple = (8, 5),
+) -> plt.Figure:
+    """
+    Plot heatmap of clustering parameter sweep results.
+
+    Parameters
+    ----------
+    sweep_df : pd.DataFrame
+        DataFrame with columns: n_neighbors, resolution, and metric_col
+    metric_col : str, optional
+        Column name for the metric to plot (default: "ari")
+    title : str, optional
+        Plot title. If None, uses f"{metric_col.upper()} of Leiden clustering"
+    figsize : tuple, optional
+        Figure size (default: (8, 5))
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    import pandas as pd
+
+    pivot = sweep_df.pivot(index="n_neighbors", columns="resolution", values=metric_col)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(pivot, annot=True, fmt=".3f", cmap="viridis", ax=ax)
+
+    if title is None:
+        title = f"{metric_col.upper()} of Leiden clustering"
+    ax.set_title(title)
+    ax.set_xlabel("Leiden resolution")
+    ax.set_ylabel("Leiden n_neighbors")
+
+    plt.tight_layout()
+    return fig
