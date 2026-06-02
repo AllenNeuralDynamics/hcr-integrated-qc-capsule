@@ -244,6 +244,7 @@ def cluster_gene_positive_cells(
     gene: str,
     expression_threshold: float,
     reference_cluster_col: str = "cluster",
+    min_cells_per_reference_cluster: int | None = None,
     n_neighbors_range: list[int] = None,
     resolution_range: list[float] = None,
     compute_umap: bool = True,
@@ -261,6 +262,10 @@ def cluster_gene_positive_cells(
         Minimum expression value for filtering
     reference_cluster_col : str, optional
         Column name in .obs containing reference clusters for ARI calculation (default: "cluster")
+    min_cells_per_reference_cluster : int | None, optional
+        If provided, remove cells whose reference cluster has fewer than this many
+        cells (computed after gene filtering). Useful to reduce tiny unstable
+        clusters before parameter sweep.
     n_neighbors_range : list[int], optional
         Values of n_neighbors to test (default: [5, 10, 15, 20, 30, 40, 50, 60, 80, 100])
     resolution_range : list[float], optional
@@ -291,6 +296,35 @@ def cluster_gene_positive_cells(
 
     print(f"Filtered to {len(adata_filtered):,} cells with {gene} > {expression_threshold}")
 
+    n_cells_after_gene_filter = len(adata_filtered)
+
+    # Optionally remove reference clusters with too few cells
+    if min_cells_per_reference_cluster is not None:
+        if min_cells_per_reference_cluster < 1:
+            raise ValueError("min_cells_per_reference_cluster must be >= 1 when provided")
+        if reference_cluster_col not in adata_filtered.obs.columns:
+            raise ValueError(
+                f"reference_cluster_col '{reference_cluster_col}' not found in adata_filtered.obs"
+            )
+
+        cluster_counts = adata_filtered.obs[reference_cluster_col].value_counts()
+        keep_clusters = cluster_counts[cluster_counts >= min_cells_per_reference_cluster].index
+        adata_filtered = adata_filtered[
+            adata_filtered.obs[reference_cluster_col].isin(keep_clusters)
+        ].copy()
+
+        print(
+            "After min cluster-size filter "
+            f"({reference_cluster_col} >= {min_cells_per_reference_cluster}), "
+            f"kept {len(adata_filtered):,} cells in {adata_filtered.obs[reference_cluster_col].nunique()} clusters"
+        )
+
+        if adata_filtered.n_obs == 0:
+            raise ValueError(
+                "No cells remain after applying min_cells_per_reference_cluster filter. "
+                "Lower threshold or adjust expression_threshold."
+            )
+
     # Set default parameter ranges
     if n_neighbors_range is None:
         n_neighbors_range = [5, 10, 15, 20, 30, 40, 50, 60, 80, 100]
@@ -302,7 +336,12 @@ def cluster_gene_positive_cells(
     for n_neighbors in n_neighbors_range:
         for resolution in resolution_range:
             sc.pp.neighbors(adata_filtered, use_rep="X", n_neighbors=n_neighbors)
-            sc.tl.leiden(adata_filtered, resolution=resolution, key_added="leiden_test")
+            sc.tl.leiden(
+                adata_filtered,
+                resolution=resolution,
+                key_added="leiden_test",
+                flavor="igraph",
+            )
 
             # Calculate ARI against reference clusters if available
             if reference_cluster_col in adata_filtered.obs.columns:
@@ -330,7 +369,7 @@ def cluster_gene_positive_cells(
     best_resolution = best.resolution
 
     sc.pp.neighbors(adata_filtered, use_rep="X", n_neighbors=best_n_neighbors)
-    sc.tl.leiden(adata_filtered, resolution=best_resolution)
+    sc.tl.leiden(adata_filtered, resolution=best_resolution, flavor="igraph")
 
     n_leiden_clusters = adata_filtered.obs["leiden"].nunique()
     print(f"Leiden found {n_leiden_clusters} clusters")
@@ -347,6 +386,8 @@ def cluster_gene_positive_cells(
             "best_resolution": best_resolution,
             "best_ari": best.ari,
         },
+        "min_cells_per_reference_cluster": min_cells_per_reference_cluster,
+        "n_cells_after_gene_filter": n_cells_after_gene_filter,
         "n_cells": len(adata_filtered),
         "n_clusters": n_leiden_clusters,
     }
@@ -393,3 +434,1146 @@ def plot_clustering_sweep_heatmap(
 
     plt.tight_layout()
     return fig
+
+
+def summarize_old_label_dispersion(
+    adata: ad.AnnData,
+    old_label_col: str,
+    new_label_col: str,
+):
+    """
+    Quantify how each old label is distributed across new labels.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData with old and new cluster labels in .obs
+    old_label_col : str
+        Column name for the original (more granular) labels
+    new_label_col : str
+        Column name for the new labels
+
+    Returns
+    -------
+    dict with:
+      - 'contingency': old x new count table
+      - 'fraction_by_old': row-normalized old x new table
+      - 'old_label_summary': one row per old label with dispersion metrics
+      - 'new_label_composition': counts/fractions of old labels within each new label
+    """
+    import pandas as pd
+
+    for col in (old_label_col, new_label_col):
+        if col not in adata.obs.columns:
+            raise ValueError(f"Column '{col}' not found in adata.obs")
+
+    df = adata.obs[[old_label_col, new_label_col]].copy()
+    df = df.dropna(subset=[old_label_col, new_label_col])
+    if df.empty:
+        raise ValueError("No cells remain after dropping NA labels")
+
+    old = df[old_label_col].astype(str)
+    new = df[new_label_col].astype(str)
+
+    contingency = pd.crosstab(old, new, dropna=False)
+    fraction_by_old = contingency.div(contingency.sum(axis=1), axis=0)
+
+    per_old_rows = []
+    for old_label, row in contingency.iterrows():
+        total_cells = int(row.sum())
+        positive = row[row > 0]
+        n_new_labels = int(positive.shape[0])
+
+        frac_row = fraction_by_old.loc[old_label]
+        max_idx = frac_row.idxmax()
+        max_frac = float(frac_row.loc[max_idx])
+
+        p = frac_row.values
+        p_nonzero = p[p > 0]
+        entropy = float(-(p_nonzero * np.log2(p_nonzero)).sum())
+        if len(p) > 1:
+            entropy_norm = float(entropy / np.log2(len(p)))
+        else:
+            entropy_norm = 0.0
+        purity = float((p ** 2).sum())
+
+        per_old_rows.append(
+            {
+                "old_label": old_label,
+                "n_cells": total_cells,
+                "n_new_labels_present": n_new_labels,
+                "dominant_new_label": str(max_idx),
+                "dominant_fraction": max_frac,
+                "is_exclusive_to_one_new_label": n_new_labels == 1,
+                "entropy": entropy,
+                "normalized_entropy": entropy_norm,
+                "purity": purity,
+            }
+        )
+
+    old_label_summary = pd.DataFrame(per_old_rows)
+    old_label_summary = old_label_summary.sort_values(
+        ["is_exclusive_to_one_new_label", "dominant_fraction", "n_cells"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    old_label_summary["dispersion_rank"] = (
+        old_label_summary["normalized_entropy"]
+        .rank(method="dense", ascending=False)
+        .astype(int)
+    )
+
+    by_new = pd.crosstab(new, old, dropna=False)
+    by_new_frac = by_new.div(by_new.sum(axis=1), axis=0)
+    new_label_composition = (
+        by_new.stack().rename("count").reset_index().rename(
+            columns={new_label_col: "new_label", old_label_col: "old_label"}
+        )
+    )
+    new_label_composition["fraction_within_new_label"] = by_new_frac.stack().values
+    new_label_composition = new_label_composition.sort_values(
+        ["new_label", "fraction_within_new_label", "count"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
+
+    return {
+        "contingency": contingency,
+        "fraction_by_old": fraction_by_old,
+        "old_label_summary": old_label_summary,
+        "new_label_composition": new_label_composition,
+    }
+
+
+def plot_new_cluster_composition_stacked(
+    adata: ad.AnnData,
+    old_label_col: str,
+    new_label_col: str,
+    normalize: bool = True,
+    min_fraction: float = 0.0,
+    figsize: tuple = (10, 5),
+    title: str | None = None,
+) -> plt.Figure:
+    """
+    Plot composition of old labels within each new cluster as a stacked bar plot.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData with old and new cluster labels in .obs
+    old_label_col : str
+        Column name for old labels
+    new_label_col : str
+        Column name for new labels
+    normalize : bool, optional
+        If True, plot fractions (bars sum to 1 per new cluster), else raw counts
+    min_fraction : float, optional
+        For normalized plots, merge old labels below this fraction into "Other"
+    figsize : tuple, optional
+        Figure size
+    title : str, optional
+        Plot title
+    """
+    import pandas as pd
+
+    for col in (old_label_col, new_label_col):
+        if col not in adata.obs.columns:
+            raise ValueError(f"Column '{col}' not found in adata.obs")
+
+    df = adata.obs[[old_label_col, new_label_col]].copy()
+    df = df.dropna(subset=[old_label_col, new_label_col])
+    if df.empty:
+        raise ValueError("No cells remain after dropping NA labels")
+
+    old = df[old_label_col].astype(str)
+    new = df[new_label_col].astype(str)
+    table = pd.crosstab(new, old, dropna=False)
+
+    plot_table = table.copy()
+    ylabel = "Cell count"
+    if normalize:
+        plot_table = table.div(table.sum(axis=1), axis=0)
+        ylabel = "Fraction of cells in new cluster"
+
+        if min_fraction > 0:
+            rare = plot_table.max(axis=0) < min_fraction
+            if rare.any():
+                other_vals = plot_table.loc[:, rare].sum(axis=1)
+                plot_table = plot_table.loc[:, ~rare]
+                plot_table["Other"] = other_vals
+
+    # Plot dominant old labels first for readability
+    col_order = plot_table.sum(axis=0).sort_values(ascending=False).index
+    plot_table = plot_table[col_order]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    x = np.arange(len(plot_table.index))
+    bottom = np.zeros(len(plot_table.index), dtype=float)
+
+    palette = sns.color_palette("tab20", n_colors=plot_table.shape[1])
+    for i, old_label in enumerate(plot_table.columns):
+        values = plot_table[old_label].values
+        ax.bar(x, values, bottom=bottom, label=old_label, color=palette[i])
+        bottom += values
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(plot_table.index.astype(str), rotation=0)
+    ax.set_xlabel(new_label_col)
+    ax.set_ylabel(ylabel)
+
+    if title is None:
+        mode = "fraction" if normalize else "count"
+        title = f"Old-label composition within each new cluster ({mode})"
+    ax.set_title(title)
+
+    ax.legend(
+        title=old_label_col,
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+        borderaxespad=0,
+        frameon=False,
+    )
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_old_new_overlap_heatmap_hierarchical(
+    adata: ad.AnnData,
+    old_label_col: str,
+    new_label_col: str,
+    normalize: Literal["old", "new", "none"] = "old",
+    figsize: tuple = (10, 8),
+    cmap: str = "mako",
+    title: str | None = None,
+) -> plt.Figure:
+    """
+    Plot old-vs-new label overlap heatmap with hierarchical ordering.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData with labels in .obs
+    old_label_col : str
+        Original label column (rows)
+    new_label_col : str
+        New label column (columns)
+    normalize : {"old", "new", "none"}, optional
+        Normalization axis:
+        - "old": each old label row sums to 1
+        - "new": each new label column sums to 1
+        - "none": raw counts
+    figsize : tuple, optional
+        Figure size
+    cmap : str, optional
+        Colormap for heatmap
+    title : str, optional
+        Custom title
+    """
+    import pandas as pd
+    from scipy.cluster.hierarchy import linkage, leaves_list
+    from scipy.spatial.distance import pdist
+
+    for col in (old_label_col, new_label_col):
+        if col not in adata.obs.columns:
+            raise ValueError(f"Column '{col}' not found in adata.obs")
+
+    df = adata.obs[[old_label_col, new_label_col]].copy().dropna()
+    if df.empty:
+        raise ValueError("No cells remain after dropping NA labels")
+
+    table = pd.crosstab(df[old_label_col].astype(str), df[new_label_col].astype(str), dropna=False)
+
+    if normalize == "old":
+        plot_data = table.div(table.sum(axis=1), axis=0).fillna(0)
+        cbar_label = "Fraction within old label"
+    elif normalize == "new":
+        plot_data = table.div(table.sum(axis=0), axis=1).fillna(0)
+        cbar_label = "Fraction within new label"
+    elif normalize == "none":
+        plot_data = table.copy()
+        cbar_label = "Cell count"
+    else:
+        raise ValueError("normalize must be one of: 'old', 'new', 'none'")
+
+    # Hierarchical ordering of rows and columns to reveal block structure.
+    row_order = plot_data.index
+    col_order = plot_data.columns
+    if plot_data.shape[0] > 1:
+        row_dist = pdist(plot_data.values, metric="euclidean")
+        row_link = linkage(row_dist, method="average")
+        row_order = plot_data.index[leaves_list(row_link)]
+    if plot_data.shape[1] > 1:
+        col_dist = pdist(plot_data.values.T, metric="euclidean")
+        col_link = linkage(col_dist, method="average")
+        col_order = plot_data.columns[leaves_list(col_link)]
+
+    ordered = plot_data.loc[row_order, col_order]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(ordered, cmap=cmap, ax=ax, cbar_kws={"label": cbar_label})
+    ax.set_xlabel(new_label_col)
+    ax.set_ylabel(old_label_col)
+    if title is None:
+        title = f"Old vs new overlap (hierarchical ordering, normalize={normalize})"
+    ax.set_title(title)
+    plt.tight_layout()
+    return fig
+
+
+def plot_old_new_log2_enrichment_heatmap(
+    adata: ad.AnnData,
+    old_label_col: str,
+    new_label_col: str,
+    eps: float = 1e-9,
+    vmax_abs: float | None = 3.0,
+    figsize: tuple = (10, 8),
+    title: str | None = None,
+) -> plt.Figure:
+    """
+    Plot log2 enrichment heatmap for old-vs-new labels.
+
+    Each cell shows log2(observed / expected), where expected is based on
+    independent marginals. Positive values indicate enrichment, negative values
+    indicate depletion.
+    """
+    import pandas as pd
+    from scipy.cluster.hierarchy import linkage, leaves_list
+    from scipy.spatial.distance import pdist
+
+    for col in (old_label_col, new_label_col):
+        if col not in adata.obs.columns:
+            raise ValueError(f"Column '{col}' not found in adata.obs")
+
+    df = adata.obs[[old_label_col, new_label_col]].copy().dropna()
+    if df.empty:
+        raise ValueError("No cells remain after dropping NA labels")
+
+    obs = pd.crosstab(df[old_label_col].astype(str), df[new_label_col].astype(str), dropna=False)
+    total = obs.values.sum()
+
+    row_marg = obs.sum(axis=1).values[:, None]
+    col_marg = obs.sum(axis=0).values[None, :]
+    expected = (row_marg * col_marg) / total
+
+    enrich = np.log2((obs.values + eps) / (expected + eps))
+    enrich_df = pd.DataFrame(enrich, index=obs.index, columns=obs.columns)
+
+    row_order = enrich_df.index
+    col_order = enrich_df.columns
+    if enrich_df.shape[0] > 1:
+        row_dist = pdist(enrich_df.values, metric="euclidean")
+        row_link = linkage(row_dist, method="average")
+        row_order = enrich_df.index[leaves_list(row_link)]
+    if enrich_df.shape[1] > 1:
+        col_dist = pdist(enrich_df.values.T, metric="euclidean")
+        col_link = linkage(col_dist, method="average")
+        col_order = enrich_df.columns[leaves_list(col_link)]
+
+    ordered = enrich_df.loc[row_order, col_order]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(
+        ordered,
+        cmap="RdBu_r",
+        center=0,
+        vmin=(-vmax_abs if vmax_abs is not None else None),
+        vmax=(vmax_abs if vmax_abs is not None else None),
+        ax=ax,
+        cbar_kws={"label": "log2(observed / expected)"},
+    )
+    ax.set_xlabel(new_label_col)
+    ax.set_ylabel(old_label_col)
+    if title is None:
+        title = "Old vs new label enrichment (log2 observed/expected)"
+    ax.set_title(title)
+    plt.tight_layout()
+    return fig
+
+
+def _leading_token(label: str) -> str:
+    """Return the first whitespace-delimited token from a label."""
+    parts = str(label).strip().split()
+    return parts[0] if parts else ""
+
+
+def map_colors_to_labels(
+    labels,
+    token_color_map: dict[str, str],
+    default_color: str = "#9e9e9e",
+    match_mode: Literal["contains", "leading_token"] = "contains",
+    case_sensitive: bool = False,
+) -> list[str]:
+    """
+    Map colors to labels using either substring matching or leading-token matching.
+
+    Parameters
+    ----------
+    labels : iterable
+        Sequence of labels to color.
+    token_color_map : dict[str, str]
+        Mapping from token/key to color.
+    default_color : str, optional
+        Fallback color when no key matches.
+    match_mode : {"contains", "leading_token"}, optional
+        Matching strategy:
+        - "contains": key appears anywhere in the label
+        - "leading_token": first token of label equals key
+    case_sensitive : bool, optional
+        Whether matching should preserve case.
+
+    Returns
+    -------
+    list[str]
+        Color for each input label.
+    """
+    if match_mode not in {"contains", "leading_token"}:
+        raise ValueError("match_mode must be 'contains' or 'leading_token'")
+
+    if case_sensitive:
+        rules = [(str(k), v) for k, v in token_color_map.items()]
+    else:
+        rules = [(str(k).lower(), v) for k, v in token_color_map.items()]
+
+    colors = []
+    for label in labels:
+        label_str = str(label)
+        probe = label_str if case_sensitive else label_str.lower()
+        lead_probe = _leading_token(label_str)
+        if not case_sensitive:
+            lead_probe = lead_probe.lower()
+
+        color = default_color
+        for key, mapped_color in rules:
+            if match_mode == "contains" and key in probe:
+                color = mapped_color
+                break
+            if match_mode == "leading_token" and key == lead_probe:
+                color = mapped_color
+                break
+        colors.append(color)
+
+    return colors
+
+
+def color_axis_ticklabels(
+    ax,
+    axis: Literal["x", "y"] = "x",
+    token_color_map: dict[str, str] | None = None,
+    default_color: str = "#9e9e9e",
+    match_mode: Literal["contains", "leading_token"] = "contains",
+    case_sensitive: bool = False,
+) -> list[str]:
+    """
+    Color tick label text for an axis based on label text matching rules.
+
+    Works with any matplotlib plot after ticks/ticklabels are set.
+    Returns the applied color list.
+    """
+    if token_color_map is None:
+        token_color_map = {}
+
+    ticklabels = ax.get_xticklabels() if axis == "x" else ax.get_yticklabels()
+    label_text = [t.get_text() for t in ticklabels]
+
+    colors = map_colors_to_labels(
+        label_text,
+        token_color_map=token_color_map,
+        default_color=default_color,
+        match_mode=match_mode,
+        case_sensitive=case_sensitive,
+    )
+
+    for tick, color in zip(ticklabels, colors):
+        tick.set_color(color)
+
+    return colors
+
+
+def subclass_palette_from_labels(
+    labels,
+    subclass_color_map: dict[str, str] | None = None,
+    default_color: str = "#9e9e9e",
+) -> list[str]:
+    """
+    Build a color list from label strings using subclass keyword matching.
+
+    A label is colored when it contains one of the subclass keys (case-insensitive).
+    Example defaults: Sst=red, Pvalb=blue, Vip=purple, Lamp5=green.
+    """
+    if subclass_color_map is None:
+        subclass_color_map = {
+            "sst": "red",
+            "pvalb": "blue",
+            "vip": "purple",
+            "lamp5": "green",
+        }
+
+    return map_colors_to_labels(
+        labels,
+        token_color_map=subclass_color_map,
+        default_color=default_color,
+        match_mode="contains",
+        case_sensitive=False,
+    )
+
+
+def plot_gene_expression_subplots(adata, genes, bins=50, ncols=4, figsize=None, title_prefix=""):
+    """
+    Plot expression distributions for multiple genes as subplots.
+    
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData object containing expression data in .X
+    genes : list of str
+        List of gene names to plot
+    bins : int, optional
+        Number of bins for histograms (default: 50)
+    ncols : int, optional
+        Number of columns in subplot grid (default: 3)
+    figsize : tuple, optional
+        Figure size (width, height). If None, auto-calculated
+    title_prefix : str, optional
+        Prefix for subplot titles (default: "Distribution of")
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The figure object
+    """
+    import math
+    
+    # Filter to genes that exist in the data
+    available_genes = [g for g in genes if g in adata.var_names]
+    missing_genes = [g for g in genes if g not in adata.var_names]
+    
+    if missing_genes:
+        print(f"Warning: {len(missing_genes)} gene(s) not found: {missing_genes}")
+    
+    if not available_genes:
+        print("Error: No valid genes found in dataset")
+        return None
+    
+    n_genes = len(available_genes)
+    nrows = math.ceil(n_genes / ncols)
+    
+    if figsize is None:
+        figsize = (ncols * 4, nrows * 3)
+    
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+    axes = np.atleast_1d(axes).flatten()  # handle single subplot case
+    
+    for idx, gene in enumerate(available_genes):
+        ax = axes[idx]
+        gene_idx = adata.var_names.get_loc(gene)
+        gene_expr = adata.X[:, gene_idx]
+        
+        sns.histplot(gene_expr, bins=bins, ax=ax, kde=False)
+        ax.set_xlabel(f"Expression (log2 CPM + 1)")
+        ax.set_title(f"{title_prefix} {gene}")
+        ax.grid(alpha=0.3)
+
+        # set ylims to 0-1000
+        axes[idx].set_ylim(0, 1000)
+    
+    # Hide empty subplots
+    for idx in range(n_genes, len(axes)):
+        axes[idx].set_visible(False)
+
+        
+    
+    plt.tight_layout()
+
+
+def compute_auc_per_old_label(
+    adata: ad.AnnData,
+    old_label_col: str,
+    new_label_col: str,
+) -> dict[str, float]:
+    """
+    Compute AUC (one-vs-rest) for each old label using new labels as predictor.
+    
+    For each old label, treat it as a binary classification problem (this label vs. all others),
+    and predict using the fraction of that old label within each new cluster.
+    
+    Parameters
+    ----------
+    adata : AnnData object with cluster labels in .obs
+    old_label_col : str, column in adata.obs with fine-grained original labels
+    new_label_col : str, column in adata.obs with coarse new labels
+    
+    Returns
+    -------
+    dict[str, float] : {old_label: auc_score}
+    """
+    from sklearn.metrics import roc_auc_score
+    import pandas as pd
+    
+    # Compute contingency table
+    contingency = pd.crosstab(adata.obs[old_label_col], adata.obs[new_label_col])
+    
+    # Normalize by new label (column) to get P(old_label | new_label)
+    contingency_norm = contingency.div(contingency.sum(axis=0), axis=1)
+    
+    auc_dict = {}
+    
+    for old_label in adata.obs[old_label_col].unique():
+        # Binary outcome: 1 if this old label, 0 otherwise
+        y_true = (adata.obs[old_label_col] == old_label).astype(int).values
+        
+        # Prediction: for each cell, use the fraction of its new cluster that is this old label
+        new_labels_in_new_label_col = adata.obs[new_label_col].values
+        y_pred = np.array([
+            contingency_norm.loc[old_label, nl] if old_label in contingency_norm.index else 0.0
+            for nl in new_labels_in_new_label_col
+        ])
+        
+        # Compute AUC
+        if len(np.unique(y_true)) < 2:
+            # Skip labels with no positive or negative examples
+            auc = np.nan
+        else:
+            auc = roc_auc_score(y_true, y_pred)
+        
+        auc_dict[old_label] = auc
+    
+    return auc_dict
+
+
+def compute_purity_by_new_label(
+    adata: ad.AnnData,
+    old_label_col: str,
+    new_label_col: str,
+) -> dict:
+    """
+    Compute purity for each new label (fraction of most common old label).
+    
+    Purity = (count of dominant old label) / (total count in this new label)
+    
+    Parameters
+    ----------
+    adata : AnnData object
+    old_label_col : str, column in adata.obs with fine-grained original labels
+    new_label_col : str, column in adata.obs with coarse new labels
+    
+    Returns
+    -------
+    dict with keys:
+      - 'purity_by_new_label': {new_label: purity_value}
+      - 'dominant_old_label_per_new': {new_label: dominant_old_label}
+      - 'n_cells_per_new_label': {new_label: n_cells}
+    """
+    import pandas as pd
+    
+    contingency = pd.crosstab(adata.obs[old_label_col], adata.obs[new_label_col])
+    
+    purity_dict = {}
+    dominant_dict = {}
+    n_cells_dict = {}
+    
+    for new_label in adata.obs[new_label_col].unique():
+        if new_label not in contingency.columns:
+            purity_dict[new_label] = 0.0
+            dominant_dict[new_label] = None
+            n_cells_dict[new_label] = 0
+        else:
+            counts = contingency[new_label]
+            total = counts.sum()
+            max_count = counts.max()
+            purity = max_count / total if total > 0 else 0.0
+            dominant = counts.idxmax()
+            
+            purity_dict[new_label] = purity
+            dominant_dict[new_label] = dominant
+            n_cells_dict[new_label] = int(total)
+    
+    return {
+        'purity_by_new_label': purity_dict,
+        'dominant_old_label_per_new': dominant_dict,
+        'n_cells_per_new_label': n_cells_dict,
+    }
+
+
+def plot_accuracy_metrics_subplots(
+    adata: ad.AnnData,
+    old_label_col: str,
+    new_label_col: str,
+    figsize: tuple = (14, 5),
+    title_prefix: str = "Cluster Accuracy Metrics",
+) -> tuple[plt.Figure, dict]:
+    """
+    Create side-by-side subplots showing:
+    1. AUC per old label (left) — how well the small gene panel distinguishes each granular cluster
+    2. Purity per new label (right) — internal homogeneity of new clusters w.r.t. old labels
+    
+    Parameters
+    ----------
+    adata : AnnData object
+    old_label_col : str, column with granular original labels
+    new_label_col : str, column with coarse new labels
+    figsize : tuple, figure size
+    title_prefix : str, title prefix for the figure
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    results_dict : dict with 'auc_per_old_label' and 'purity_metrics'
+    """
+    import pandas as pd
+    
+    # Compute metrics
+    auc_per_old = compute_auc_per_old_label(adata, old_label_col, new_label_col)
+    purity_metrics = compute_purity_by_new_label(adata, old_label_col, new_label_col)
+    
+    # Create figure with 2 subplots
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    
+    # --- Subplot 1: AUC per old label ---
+    ax1 = axes[0]
+    auc_df = pd.Series(auc_per_old).sort_values(ascending=False)
+    valid_auc = auc_df[~auc_df.isna()]
+    
+    sns.barplot(x=valid_auc.values, y=valid_auc.index, ax=ax1, palette="viridis")
+    ax1.set_xlabel("AUC (one-vs-rest)")
+    ax1.set_ylabel(f"{old_label_col}")
+    ax1.set_title(f"Discriminability of {old_label_col}\n(higher = better distinction by new panel)")
+    ax1.set_xlim([0, 1])
+    ax1.axvline(0.8, color="red", linestyle="--", linewidth=1.5, alpha=0.5, label="AUC=0.8")
+    ax1.axvline(0.7, color="orange", linestyle="--", linewidth=1.5, alpha=0.5, label="AUC=0.7")
+    ax1.legend(loc="lower right", fontsize=9)
+    ax1.grid(axis="x", alpha=0.3)
+    
+    # --- Subplot 2: Purity per new label ---
+    ax2 = axes[1]
+    purity_by_new = purity_metrics['purity_by_new_label']
+    dominant_by_new = purity_metrics['dominant_old_label_per_new']
+    n_cells_by_new = purity_metrics['n_cells_per_new_label']
+    
+    purity_series = pd.Series(purity_by_new).sort_values(ascending=False)
+    
+    # Create color map based on dominant old label
+    subclass_color_map = {
+        "sst": "#E41A1C",
+        "pvalb": "#377EB8",
+        "vip": "#984EA3",
+        "lamp5": "#4DAF4A",
+    }
+    
+    colors = []
+    for new_label in purity_series.index:
+        dominant = dominant_by_new.get(new_label)
+        if dominant:
+            dominant_lower = str(dominant).lower()
+            # Check if any key matches the leading token
+            color = None
+            for token, col in subclass_color_map.items():
+                if dominant_lower.startswith(token):
+                    color = col
+                    break
+            if color is None:
+                color = "#CCCCCC"
+        else:
+            color = "#CCCCCC"
+        colors.append(color)
+    
+    bars = ax2.bar(range(len(purity_series)), purity_series.values, color=colors)
+    ax2.set_xticks(range(len(purity_series)))
+    ax2.set_xticklabels(purity_series.index, rotation=45, ha="right")
+    ax2.set_ylabel("Purity")
+    ax2.set_xlabel(f"{new_label_col}")
+    ax2.set_title(f"Homogeneity of {new_label_col}\n(higher = cells from single old cluster)")
+    ax2.set_ylim([0, 1.05])
+    ax2.axhline(0.8, color="red", linestyle="--", linewidth=1.5, alpha=0.5, label="Purity=0.8")
+    ax2.axhline(0.7, color="orange", linestyle="--", linewidth=1.5, alpha=0.5, label="Purity=0.7")
+    ax2.legend(loc="lower right", fontsize=9)
+    ax2.grid(axis="y", alpha=0.3)
+    
+    # Add cell count labels on bars (if space allows)
+    for idx, (new_label, purity) in enumerate(purity_series.items()):
+        n_cells = n_cells_by_new.get(new_label, 0)
+        if n_cells > 0:
+            ax2.text(idx, purity + 0.02, f"n={n_cells}", ha="center", va="bottom", fontsize=8)
+    
+    fig.suptitle(title_prefix, fontsize=14, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    
+    return fig, {
+        'auc_per_old_label': auc_per_old,
+        'purity_metrics': purity_metrics,
+    }
+
+
+def compute_knn_soft_votes(
+    adata: ad.AnnData,
+    label_col: str,
+    n_neighbors: int = 15,
+) -> "pd.DataFrame":
+    """
+    Compute per-cell soft-vote probabilities using k-nearest neighbors in gene expression space.
+
+    For each cell, the k nearest neighbors (by Euclidean distance in adata.X) cast votes
+    for their label. The result is a probability vector over all labels.
+
+    This is label-source-agnostic: pass old Tasic cluster labels to measure how well the
+    small gene panel recovers the original fine-grained taxonomy, or pass Leiden/k-means
+    labels to measure new-cluster confidence.
+
+    Parameters
+    ----------
+    adata : AnnData object (cells × genes, log-normalised)
+    label_col : str, column in adata.obs with cluster labels
+    n_neighbors : int, number of nearest neighbours to use (default 15)
+
+    Returns
+    -------
+    pd.DataFrame, shape (n_cells, n_labels)
+        Soft-vote probability matrix. Index matches adata.obs_names.
+        Columns are unique label values.
+        Additional series accessible as:
+          - df.max(axis=1)          → per-cell confidence (max posterior)
+          - df.max(axis=1) - df.apply(lambda r: r.nlargest(2).iloc[-1], axis=1)
+                                    → per-cell margin (P1 − P2)
+          - (-df * np.log2(df + 1e-9)).sum(axis=1) → per-cell entropy
+    """
+    import pandas as pd
+    from sklearn.neighbors import NearestNeighbors
+
+    X = adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray()
+    labels = adata.obs[label_col].values
+    unique_labels = sorted(adata.obs[label_col].unique())
+
+    # Fit k-NN (k+1 to exclude the cell itself)
+    nn = NearestNeighbors(n_neighbors=n_neighbors + 1, metric="euclidean", n_jobs=-1)
+    nn.fit(X)
+    _, indices = nn.kneighbors(X)
+    # Drop the first column (self)
+    indices = indices[:, 1:]
+
+    # For each cell, count neighbor votes per label
+    label_to_idx = {lbl: i for i, lbl in enumerate(unique_labels)}
+    n_cells = X.shape[0]
+    n_labels = len(unique_labels)
+    vote_matrix = np.zeros((n_cells, n_labels), dtype=np.float32)
+
+    for cell_i, neighbor_idxs in enumerate(indices):
+        for nb_idx in neighbor_idxs:
+            lbl = labels[nb_idx]
+            vote_matrix[cell_i, label_to_idx[lbl]] += 1.0
+
+    # Normalise to probabilities
+    vote_matrix /= n_neighbors
+
+    return pd.DataFrame(vote_matrix, index=adata.obs_names, columns=unique_labels)
+
+
+def plot_knn_confidence_subplots(
+    adata: ad.AnnData,
+    label_col: str,
+    n_neighbors: int = 15,
+    figsize: tuple = (14, 5),
+    title: str = "k-NN soft-vote confidence",
+    sort_by: str = "mean_confidence",
+) -> tuple["plt.Figure", "pd.DataFrame"]:
+    """
+    Visualise per-cluster k-NN soft-vote confidence using two subplots:
+
+    Left  — Mean confidence (max posterior) per cluster, sorted descending.
+            Whiskers show ±1 SD across cells in that cluster.
+    Right — Mean margin (P_top1 − P_top2) per cluster, sorted the same way.
+            Margin distinguishes genuinely confident clusters from ambiguous ones.
+
+    The label_col can be the **old** Tasic cluster labels (ground-truth recovery) or
+    any new clustering output (Leiden, k-means, hierarchical).
+
+    Parameters
+    ----------
+    adata : AnnData object
+    label_col : str, column in adata.obs with cluster labels
+    n_neighbors : int, k for k-NN voting (default 15)
+    figsize : tuple
+    title : str, figure suptitle
+    sort_by : 'mean_confidence' or 'mean_margin' — which metric to sort bars by
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    soft_probs : pd.DataFrame, soft-vote probability matrix (cells × labels)
+    """
+    import pandas as pd
+
+    soft_probs = compute_knn_soft_votes(adata, label_col=label_col, n_neighbors=n_neighbors)
+
+    # Per-cell derived metrics
+    confidence = soft_probs.max(axis=1)          # max posterior per cell
+    # Margin: P_top1 − P_top2
+    sorted_probs = np.sort(soft_probs.values, axis=1)
+    margin = pd.Series(sorted_probs[:, -1] - sorted_probs[:, -2], index=adata.obs_names)
+    entropy = -(soft_probs * np.log2(soft_probs + 1e-9)).sum(axis=1)
+
+    labels = adata.obs[label_col].values
+    unique_labels = soft_probs.columns.tolist()
+
+    # Aggregate per cluster
+    stats = []
+    for lbl in unique_labels:
+        mask = labels == lbl
+        stats.append({
+            "label": lbl,
+            "n_cells": int(mask.sum()),
+            "mean_confidence": float(confidence[mask].mean()),
+            "std_confidence": float(confidence[mask].std()),
+            "mean_margin": float(margin[mask].mean()),
+            "std_margin": float(margin[mask].std()),
+            "mean_entropy": float(entropy[mask].mean()),
+        })
+
+    stats_df = pd.DataFrame(stats)
+
+    # Sort
+    sort_col = sort_by if sort_by in stats_df.columns else "mean_confidence"
+    stats_df = stats_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+    # Subclass color map for bar colors
+    _subclass_colors = {"sst": "#E41A1C", "pvalb": "#377EB8", "vip": "#984EA3", "lamp5": "#4DAF4A"}
+
+    def _label_color(lbl):
+        lbl_lower = str(lbl).lower()
+        for token, col in _subclass_colors.items():
+            if lbl_lower.startswith(token):
+                return col
+        return "#AAAAAA"
+
+    colors = [_label_color(lbl) for lbl in stats_df["label"]]
+    x = np.arange(len(stats_df))
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # --- Left: mean confidence ± SD ---
+    ax1 = axes[0]
+    ax1.bar(x, stats_df["mean_confidence"], color=colors, yerr=stats_df["std_confidence"],
+            capsize=3, error_kw={"elinewidth": 1, "alpha": 0.6})
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(stats_df["label"], rotation=45, ha="right", fontsize=8)
+    ax1.set_ylabel("Mean confidence (max posterior)")
+    ax1.set_xlabel(label_col)
+    ax1.set_ylim([0, 1.05])
+    ax1.axhline(0.8, color="red", linestyle="--", linewidth=1.2, alpha=0.5, label="0.8")
+    ax1.axhline(0.6, color="orange", linestyle="--", linewidth=1.2, alpha=0.5, label="0.6")
+    ax1.legend(title="Threshold", fontsize=8)
+    ax1.grid(axis="y", alpha=0.3)
+    ax1.set_title("Confidence\n(how strongly do neighbors agree?)")
+    color_axis_ticklabels(ax1, axis="x", token_color_map=_subclass_colors,
+                          default_color="#4d4d4d", match_mode="leading_token")
+
+    # --- Right: mean margin ± SD ---
+    ax2 = axes[1]
+    ax2.bar(x, stats_df["mean_margin"], color=colors, yerr=stats_df["std_margin"],
+            capsize=3, error_kw={"elinewidth": 1, "alpha": 0.6})
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(stats_df["label"], rotation=45, ha="right", fontsize=8)
+    ax2.set_ylabel("Mean margin (P₁ − P₂)")
+    ax2.set_xlabel(label_col)
+    ax2.set_ylim([0, 1.05])
+    ax2.axhline(0.4, color="red", linestyle="--", linewidth=1.2, alpha=0.5, label="0.4")
+    ax2.axhline(0.2, color="orange", linestyle="--", linewidth=1.2, alpha=0.5, label="0.2")
+    ax2.legend(title="Threshold", fontsize=8)
+    ax2.grid(axis="y", alpha=0.3)
+    ax2.set_title("Margin\n(how much better is top-1 vs top-2?)")
+    color_axis_ticklabels(ax2, axis="x", token_color_map=_subclass_colors,
+                          default_color="#4d4d4d", match_mode="leading_token")
+
+    fig.suptitle(
+        f"{title}\n(n_neighbors={n_neighbors}, n={len(adata)} cells, label='{label_col}')",
+        fontsize=13, fontweight="bold", y=1.03,
+    )
+    plt.tight_layout()
+
+    # Attach per-cell series to soft_probs for downstream use
+    soft_probs["_confidence"] = confidence.values
+    soft_probs["_margin"] = margin.values
+    soft_probs["_entropy"] = entropy.values
+
+    return fig, soft_probs
+
+
+def top_discriminable_genes_per_cluster(
+    adata: ad.AnnData,
+    cluster_col: str = "leiden",
+    top_n: int = 3,
+    exclude_genes: tuple[str, ...] | list[str] = ("Gad2", "Sst"),
+    use_abs_effect_size: bool = False,
+    include_depleted: bool = False,
+    bootstrap_iterations: int = 0,
+    random_state: int = 0,
+) -> "pd.DataFrame":
+    """
+    Rank most discriminable genes per cluster using one-vs-rest separation.
+
+    For each cluster and each gene:
+      score = (mean_in_cluster - mean_out_cluster) / std_all_cells
+
+    Higher positive score means the gene is enriched in that cluster and better
+    separates it from the rest. By default, canonical exclusion genes (Gad2, Sst)
+    are removed before ranking.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Cells x genes matrix.
+    cluster_col : str
+        Column in adata.obs with cluster labels (default: "leiden").
+    top_n : int
+        Number of top genes to report per cluster (default: 3).
+    exclude_genes : tuple[str, ...] | list[str]
+        Genes to exclude from ranking (case-insensitive exact match).
+    use_abs_effect_size : bool
+        If True, rank by absolute effect size; if False (default), rank by
+        positive enrichment effect size.
+    include_depleted : bool
+        If True, also return most depleted genes per cluster (most negative
+        effect sizes) with direction='depleted'.
+    bootstrap_iterations : int
+        Number of bootstrap resamples (cells sampled with replacement) used to
+        estimate marker stability. Set 0 to disable (default).
+    random_state : int
+        Random seed for bootstrap reproducibility.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-form table with columns:
+                    cluster, rank, gene, effect_size, mean_in, mean_out, std_all,
+                    direction, stability_pct
+
+    Notes
+    -----
+    - This is descriptive separability, not a p-value test.
+    - Works best on normalized/log-transformed expression (e.g., log CPM).
+    """
+    import pandas as pd
+
+    if cluster_col not in adata.obs.columns:
+        raise ValueError(f"cluster_col '{cluster_col}' not found in adata.obs")
+    if top_n < 1:
+        raise ValueError("top_n must be >= 1")
+    if bootstrap_iterations < 0:
+        raise ValueError("bootstrap_iterations must be >= 0")
+
+    # Build dense matrix safely if needed
+    X = adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray()
+    X = np.asarray(X, dtype=np.float64)
+
+    gene_names = np.asarray(adata.var_names.astype(str))
+    cluster_labels = adata.obs[cluster_col].astype(str).values
+    unique_clusters = pd.Index(cluster_labels).unique().tolist()
+
+    # Case-insensitive exclusion mask
+    exclude_set = {g.lower() for g in exclude_genes}
+    keep_gene_mask = np.array([g.lower() not in exclude_set for g in gene_names], dtype=bool)
+    if not np.any(keep_gene_mask):
+        raise ValueError("All genes were excluded; adjust exclude_genes")
+
+    X_keep = X[:, keep_gene_mask]
+    genes_keep = gene_names[keep_gene_mask]
+
+    std_all = X_keep.std(axis=0)
+    std_all_safe = np.where(std_all <= 1e-12, 1e-12, std_all)
+
+    def _compute_top_rows(
+        X_local: np.ndarray,
+        labels_local: np.ndarray,
+    ) -> list[dict]:
+        """Compute top enriched/depleted rows for a given matrix/labels."""
+        local_rows = []
+        local_clusters = pd.Index(labels_local).unique().tolist()
+
+        for cl in local_clusters:
+            in_mask = labels_local == cl
+            out_mask = ~in_mask
+
+            if in_mask.sum() == 0 or out_mask.sum() == 0:
+                continue
+
+            mean_in = X_local[in_mask].mean(axis=0)
+            mean_out = X_local[out_mask].mean(axis=0)
+            effect = (mean_in - mean_out) / std_all_safe
+
+            ranking_score = np.abs(effect) if use_abs_effect_size else effect
+            top_idx = np.argsort(ranking_score)[::-1][:top_n]
+
+            for r, gi in enumerate(top_idx, start=1):
+                local_rows.append(
+                    {
+                        "cluster": cl,
+                        "rank": r,
+                        "gene": genes_keep[gi],
+                        "effect_size": float(effect[gi]),
+                        "mean_in": float(mean_in[gi]),
+                        "mean_out": float(mean_out[gi]),
+                        "std_all": float(std_all[gi]),
+                        "n_in_cluster": int(in_mask.sum()),
+                        "n_out_cluster": int(out_mask.sum()),
+                        "direction": "enriched",
+                    }
+                )
+
+            if include_depleted:
+                bottom_idx = np.argsort(effect)[:top_n]
+                for r, gi in enumerate(bottom_idx, start=1):
+                    local_rows.append(
+                        {
+                            "cluster": cl,
+                            "rank": r,
+                            "gene": genes_keep[gi],
+                            "effect_size": float(effect[gi]),
+                            "mean_in": float(mean_in[gi]),
+                            "mean_out": float(mean_out[gi]),
+                            "std_all": float(std_all[gi]),
+                            "n_in_cluster": int(in_mask.sum()),
+                            "n_out_cluster": int(out_mask.sum()),
+                            "direction": "depleted",
+                        }
+                    )
+
+        return local_rows
+
+    rows = _compute_top_rows(X_keep, cluster_labels)
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
+    result["stability_pct"] = np.nan
+
+    # Bootstrap stability: frequency that each selected marker appears in top_n
+    if bootstrap_iterations > 0:
+        rng = np.random.default_rng(random_state)
+        n_cells = X_keep.shape[0]
+
+        # Count appearances by (cluster, direction, gene)
+        stability_counter: dict[tuple[str, str, str], int] = {}
+
+        for _ in range(bootstrap_iterations):
+            boot_idx = rng.choice(n_cells, size=n_cells, replace=True)
+            X_boot = X_keep[boot_idx]
+            labels_boot = cluster_labels[boot_idx]
+
+            boot_rows = _compute_top_rows(X_boot, labels_boot)
+            if not boot_rows:
+                continue
+
+            # Count each selected gene once per cluster/direction per iteration
+            seen = set()
+            for row in boot_rows:
+                key = (str(row["cluster"]), str(row["direction"]), str(row["gene"]))
+                if key not in seen:
+                    stability_counter[key] = stability_counter.get(key, 0) + 1
+                    seen.add(key)
+
+        def _stability_lookup(row: "pd.Series") -> float:
+            key = (str(row["cluster"]), str(row["direction"]), str(row["gene"]))
+            return 100.0 * stability_counter.get(key, 0) / float(bootstrap_iterations)
+
+        result["stability_pct"] = result.apply(_stability_lookup, axis=1)
+
+    return result.sort_values(["cluster", "direction", "rank"]).reset_index(drop=True)
