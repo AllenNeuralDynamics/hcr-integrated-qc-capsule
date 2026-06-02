@@ -210,6 +210,196 @@ def plot_subclass_heatmap(
     return fig
 
 
+def plot_cell_gene_with_cluster_means(
+    adata: ad.AnnData,
+    cluster_col: str = "leiden",
+    gene_order: list[str] | None = None,
+    cluster_order: list[str] | None = None,
+    cluster_label_map: dict[str, str] | None = None,
+    cluster_label_df=None,
+    cluster_label_col: str = "cluster_label_string",
+    clip_range: tuple[float, float] | None = None,
+    figsize: tuple[float, float] = (14, 6),
+    cmap: str = "magma",
+    title: str | None = None,
+) -> tuple[plt.Figure, "pd.DataFrame"]:
+    """
+    Plot two aligned heatmaps:
+      1) Cell x gene matrix ordered by cluster
+      2) Mean gene expression per cluster
+
+    Parameters
+    ----------
+    adata : AnnData
+        Expression matrix (cells x genes).
+    cluster_col : str
+        Column in adata.obs containing cluster labels (default: "leiden").
+    gene_order : list[str] | None
+        Optional ordered subset of genes to plot. If None, uses adata.var_names order.
+    cluster_order : list[str] | None
+        Optional ordered subset/order of clusters. If None, uses sorted unique labels.
+    cluster_label_map : dict[str, str] | None
+        Optional mapping from cluster id -> display label.
+    cluster_label_df : pd.DataFrame | None
+        Optional table with columns [cluster_col, cluster_label_col] used to build
+        cluster_label_map.
+    cluster_label_col : str
+        Label column name in cluster_label_df (default: "cluster_label_string").
+    clip_range : tuple[float, float] | None
+        Optional clipping range for expression values before plotting.
+    figsize : tuple
+        Figure size.
+    cmap : str
+        Colormap for both heatmaps.
+    title : str | None
+        Optional figure title.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    mean_df : pd.DataFrame
+        Cluster x gene mean expression table used for the right subplot.
+    """
+    import pandas as pd
+
+    if cluster_col not in adata.obs.columns:
+        raise ValueError(f"cluster_col '{cluster_col}' not found in adata.obs")
+
+    if gene_order is None:
+        genes = list(adata.var_names.astype(str))
+    else:
+        missing = [g for g in gene_order if g not in adata.var_names]
+        if missing:
+            raise ValueError(f"Genes not found in adata.var_names: {missing}")
+        genes = list(gene_order)
+
+    if cluster_order is None:
+        clusters = sorted(adata.obs[cluster_col].astype(str).unique().tolist())
+    else:
+        clusters = [str(c) for c in cluster_order]
+
+    labels = adata.obs[cluster_col].astype(str).values
+    cluster_mask = np.isin(labels, clusters)
+    if not np.any(cluster_mask):
+        raise ValueError("No cells left after applying cluster_order filter")
+
+    adata_use = adata[cluster_mask, genes].copy()
+    labels_use = adata_use.obs[cluster_col].astype(str).values
+
+    if clip_range is not None:
+        if len(clip_range) != 2:
+            raise ValueError("clip_range must be a (min, max) tuple")
+        clip_min, clip_max = clip_range
+    else:
+        clip_min, clip_max = None, None
+
+    # Build cluster label map from table if provided.
+    label_map = dict(cluster_label_map) if cluster_label_map is not None else {}
+    if cluster_label_df is not None:
+        cols = set(cluster_label_df.columns)
+        if cluster_col in cols:
+            key_col = cluster_col
+        elif "cluster" in cols:
+            key_col = "cluster"
+        else:
+            raise ValueError(
+                f"cluster_label_df must contain '{cluster_col}' or 'cluster', and '{cluster_label_col}'; "
+                f"found {cols}"
+            )
+        if cluster_label_col not in cols:
+            raise ValueError(
+                f"cluster_label_df must contain '{cluster_label_col}'; found {cols}"
+            )
+
+        tmp = cluster_label_df[[key_col, cluster_label_col]].copy()
+        tmp[key_col] = tmp[key_col].astype(str)
+        tmp[cluster_label_col] = tmp[cluster_label_col].astype(str)
+        label_map.update(dict(zip(tmp[key_col], tmp[cluster_label_col])))
+
+    # Order cells by cluster for the left heatmap.
+    cat = pd.Categorical(labels_use, categories=clusters, ordered=True)
+    order_idx = np.argsort(cat.codes)
+
+    X = adata_use.X if not hasattr(adata_use.X, "toarray") else adata_use.X.toarray()
+    X = np.asarray(X, dtype=float)
+    X_cells = X[order_idx, :]
+    labels_ord = labels_use[order_idx]
+
+    if clip_min is not None and clip_max is not None:
+        X_cells_plot = np.clip(X_cells, clip_min, clip_max)
+    else:
+        X_cells_plot = X_cells
+
+    # Mean expression per cluster for right heatmap.
+    mean_rows = []
+    present_clusters = []
+    for cl in clusters:
+        m = labels_use == cl
+        if not np.any(m):
+            continue
+        present_clusters.append(cl)
+        mean_rows.append(X[m].mean(axis=0))
+
+    mean_mat = np.vstack(mean_rows)
+    if clip_min is not None and clip_max is not None:
+        mean_mat_plot = np.clip(mean_mat, clip_min, clip_max)
+    else:
+        mean_mat_plot = mean_mat
+
+    mean_df = pd.DataFrame(mean_mat, index=present_clusters, columns=genes)
+
+    display_labels = [f"{cl}: {label_map.get(cl, cl)}" for cl in present_clusters]
+
+    fig, (ax1, ax2) = plt.subplots(
+        1,
+        2,
+        figsize=figsize,
+        gridspec_kw={"width_ratios": [3.2, 1.3]},
+    )
+
+    # Left: cell x gene
+    im1 = ax1.imshow(X_cells_plot, aspect="auto", cmap=cmap)
+    ax1.set_xlabel("Gene")
+    ax1.set_ylabel("Cells (ordered by cluster)")
+    ax1.set_title("Cell x gene (ordered by cluster)")
+    ax1.set_xticks(range(len(genes)))
+    ax1.set_xticklabels(genes, rotation=90, ha="right", fontsize=8)
+
+    # Draw cluster boundaries on cell heatmap.
+    boundary_positions = []
+    prev = None
+    for i, cl in enumerate(labels_ord):
+        if prev is None:
+            prev = cl
+            continue
+        if cl != prev:
+            boundary_positions.append(i - 0.5)
+            prev = cl
+    for y in boundary_positions:
+        ax1.axhline(y, color="white", linewidth=0.7, alpha=0.8)
+
+    # Right: mean per cluster
+    im2 = ax2.imshow(mean_mat_plot, aspect="auto", cmap=cmap)
+    ax2.set_xlabel("Gene")
+    ax2.set_ylabel(cluster_col)
+    ax2.set_title("Mean expression per cluster")
+    ax2.set_xticks(range(len(genes)))
+    ax2.set_xticklabels(genes, rotation=90, ha="right", fontsize=8)
+    ax2.set_yticks(range(len(display_labels)))
+    ax2.set_yticklabels(display_labels, fontsize=8)
+
+    cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.03, pad=0.01)
+    cbar1.set_label("Expression")
+    cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.08, pad=0.03)
+    cbar2.set_label("Mean expression")
+
+    if title is None:
+        title = f"Cell x gene and cluster means ({cluster_col})"
+    fig.suptitle(title, fontsize=12, y=1.01)
+    plt.tight_layout()
+    return fig, mean_df
+
+
 
 def make_filtered_views_for_smartseq(adata: ad.AnnData) -> dict[str, ad.AnnData]:
     """
@@ -1577,3 +1767,149 @@ def top_discriminable_genes_per_cluster(
         result["stability_pct"] = result.apply(_stability_lookup, axis=1)
 
     return result.sort_values(["cluster", "direction", "rank"]).reset_index(drop=True)
+
+
+def top_discriminable_gene_pairs_per_cluster(
+    adata: ad.AnnData,
+    cluster_col: str = "leiden",
+    top_n: int = 3,
+    exclude_genes: tuple[str, ...] | list[str] = ("Gad2", "Sst"),
+    min_nonzero_fraction: float = 0.05,
+) -> "pd.DataFrame":
+    """
+    Find the gene pairs that best discriminate each cluster (one-vs-rest),
+    allowing each gene to contribute positively (+) or negatively (-).
+
+    For every ordered pair (gene_A, gene_B) and each sign combination
+    (s_A, s_B) ∈ {+1, -1}², the combined signal per cell is:
+
+        signal = s_A * expr_A + s_B * expr_B
+
+    The one-vs-rest effect size is then:
+
+        effect = (mean_in - mean_out) / std_all
+
+    where std_all is the std of the combined signal across all cells.
+    Canonical form: we always use sign_A = +1 and allow sign_B ∈ {+1, -1},
+    which avoids double-counting (flipping both signs inverts the effect size
+    symmetrically and the best positive pair is the mirror of the best
+    negative pair).
+
+    This answers questions like:
+    "Which clusters are uniquely identified by Calb2-high AND Crh-low cells?"
+
+    Parameters
+    ----------
+    adata : AnnData
+    cluster_col : str
+        Column in adata.obs with cluster labels (default: "leiden").
+    top_n : int
+        Number of top gene pairs per cluster to return (default: 3).
+    exclude_genes : tuple | list
+        Genes to exclude from ranking (case-insensitive exact match).
+    min_nonzero_fraction : float
+        Minimum fraction of cells that must have nonzero expression for a gene
+        to be eligible for pairing (default: 0.05).  Genes that are near-zero
+        in almost all cells can produce spuriously high effect sizes (especially
+        as the "−" component of a pair) and are suppressed by this filter.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-form table with columns:
+          cluster, rank, gene_A, sign_A, gene_B, sign_B,
+          pair_label, effect_size, mean_in, mean_out, std_all,
+          n_in_cluster, n_out_cluster
+
+        pair_label is a human-readable string, e.g. "Calb2+ / Crh-".
+    """
+    import pandas as pd
+    from itertools import combinations
+
+    if cluster_col not in adata.obs.columns:
+        raise ValueError(f"cluster_col '{cluster_col}' not found in adata.obs")
+
+    X = adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray()
+    X = np.asarray(X, dtype=np.float64)
+
+    gene_names = np.asarray(adata.var_names.astype(str))
+    cluster_labels = adata.obs[cluster_col].astype(str).values
+    unique_clusters = pd.Index(cluster_labels).unique().tolist()
+
+    exclude_set = {g.lower() for g in exclude_genes}
+    keep_mask = np.array([g.lower() not in exclude_set for g in gene_names], dtype=bool)
+    if not np.any(keep_mask):
+        raise ValueError("All genes were excluded; adjust exclude_genes")
+
+    X_keep = X[:, keep_mask]
+    genes_keep = gene_names[keep_mask]
+
+    # Drop genes that are nonzero in fewer than min_nonzero_fraction of all cells
+    if min_nonzero_fraction > 0:
+        nonzero_frac = (X_keep > 0).mean(axis=0)
+        expr_mask = nonzero_frac >= min_nonzero_fraction
+        X_keep = X_keep[:, expr_mask]
+        genes_keep = genes_keep[expr_mask]
+
+    n_genes = X_keep.shape[1]
+    gene_indices = list(range(n_genes))
+
+    rows = []
+    for cl in unique_clusters:
+        in_mask = cluster_labels == cl
+        out_mask = ~in_mask
+        if in_mask.sum() == 0 or out_mask.sum() == 0:
+            continue
+
+        best_pairs: list[tuple[float, dict]] = []
+
+        for i, j in combinations(gene_indices, 2):
+            # sign_A is always +1; sign_B ∈ {+1, -1} to avoid double-counting
+            for sign_B in (1, -1):
+                signal = X_keep[:, i] + sign_B * X_keep[:, j]
+                std_all = signal.std()
+                if std_all <= 1e-12:
+                    continue
+                mean_in = signal[in_mask].mean()
+                mean_out = signal[out_mask].mean()
+                effect = (mean_in - mean_out) / std_all
+
+                sign_A_str = "+"
+                sign_B_str = "+" if sign_B == 1 else "-"
+                pair_label = f"{genes_keep[i]}{sign_A_str} / {genes_keep[j]}{sign_B_str}"
+
+                best_pairs.append((effect, {
+                    "cluster": cl,
+                    "gene_A": genes_keep[i],
+                    "sign_A": "+",
+                    "gene_B": genes_keep[j],
+                    "sign_B": sign_B_str,
+                    "pair_label": pair_label,
+                    "effect_size": float(effect),
+                    "mean_in": float(mean_in),
+                    "mean_out": float(mean_out),
+                    "std_all": float(std_all),
+                    "n_in_cluster": int(in_mask.sum()),
+                    "n_out_cluster": int(out_mask.sum()),
+                }))
+
+        # Sort by effect size descending, take top_n
+        best_pairs.sort(key=lambda x: x[0], reverse=True)
+        for rank, (_, row_dict) in enumerate(best_pairs[:top_n], start=1):
+            row_dict["rank"] = rank
+            rows.append(row_dict)
+
+    if not rows:
+        return pd.DataFrame()
+
+    col_order = [
+        "cluster", "rank", "pair_label",
+        "gene_A", "sign_A", "gene_B", "sign_B",
+        "effect_size", "mean_in", "mean_out", "std_all",
+        "n_in_cluster", "n_out_cluster",
+    ]
+    return (
+        pd.DataFrame(rows)[col_order]
+        .sort_values(["cluster", "rank"])
+        .reset_index(drop=True)
+    )
