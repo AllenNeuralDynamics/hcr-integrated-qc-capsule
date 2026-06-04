@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import warnings
 from pathlib import Path
@@ -45,6 +46,7 @@ V1_CELLS_CSV = Path("/root/capsule/code/v1_merfish_cells.csv")
 SS_PATH = Path("/root/capsule/scratch/mouse_VISp_gene_expression_matrices_2018-06-14")
 DATA_DIR = Path("/root/capsule/data")
 DEFAULT_OUT_DIR = Path("/root/capsule/scratch/reference_atlas_cellxgene")
+REFERENCE_MATRIX_CACHE_DIR = DEFAULT_OUT_DIR / "_cached_reference_matrices"
 
 DROP_LAYERS = ["VISp6a", "VISp6b"]
 INHIBITORY_REF_CLASSES = ["07 CTX-MGE GABA", "06 CTX-CGE GABA"]
@@ -231,6 +233,23 @@ def _write_run_metadata(out_dir: Path, metadata: dict) -> None:
     (out_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2))
 
 
+def _cache_dir_for(dataset_name: str, cache_payload: dict) -> Path:
+    key_json = json.dumps(cache_payload, sort_keys=True)
+    key_hash = hashlib.md5(key_json.encode("utf-8")).hexdigest()[:12]
+    return REFERENCE_MATRIX_CACHE_DIR / dataset_name / key_hash
+
+
+def _try_read_parquet(path: Path) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+    return pd.read_parquet(path)
+
+
+def _write_parquet(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path)
+
+
 def _subset_to_hcr_panel(cxg: pd.DataFrame, panel_genes: list[str]) -> pd.DataFrame:
     if len(panel_genes) == 0:
         raise ValueError("HCR_PANEL_GENES is empty. Define panel genes at the top of this script.")
@@ -273,30 +292,60 @@ def run_merfish(
     out_dir = out_root / "merfish"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[MERFISH 1/4] Loading V1 VISp cell index...")
-    v1_cells = _load_v1_merfish_cells()
-    print(f"  V1 cells retained: {len(v1_cells):,}")
+    cache_payload = {
+        "dataset": "merfish",
+        "label_level": label_level,
+        "min_label_cells": int(min_label_cells),
+        "expression_scale": merfish_expression_scale,
+        "drop_layers": DROP_LAYERS,
+        "ref_classes": INHIBITORY_REF_CLASSES,
+        "panel_genes": HCR_PANEL_GENES,
+        "v1_cells_csv": str(V1_CELLS_CSV),
+    }
+    cache_dir = _cache_dir_for("merfish", cache_payload)
+    cache_cxg_path = cache_dir / "cell_x_gene.parquet"
+    cache_labels_path = cache_dir / f"labels_{label_level}.parquet"
+    used_cache = False
 
-    print("[MERFISH 2/4] Using HCR_PANEL_GENES for atlas subsetting...")
-    print(f"  HCR panel genes requested: {len(HCR_PANEL_GENES):,}")
-    print(f"  Expression scale: {merfish_expression_scale}")
+    cached_cxg = _try_read_parquet(cache_cxg_path)
+    cached_labels = _try_read_parquet(cache_labels_path)
+    if cached_cxg is not None and cached_labels is not None:
+        used_cache = True
+        ref_counts = cached_cxg.copy()
+        if label_level in cached_labels.columns:
+            ref_labels = cached_labels[label_level].copy()
+        else:
+            ref_labels = cached_labels.iloc[:, 0].rename(label_level)
+        print(f"[MERFISH cache] Loaded cached matrices from {cache_dir}")
+    else:
+        print("[MERFISH 1/4] Loading V1 VISp cell index...")
+        v1_cells = _load_v1_merfish_cells()
+        print(f"  V1 cells retained: {len(v1_cells):,}")
 
-    print("[MERFISH 3/4] Loading inhibitory reference counts from ABC Atlas...")
-    ref_counts, ref_labels = atlas_compare.load_abc_merfish_reference(
-        abc_cache_dir=ABC_ATLAS_DIR,
-        genes=HCR_PANEL_GENES,
-        cell_index=v1_cells.index,
-        ref_classes=INHIBITORY_REF_CLASSES,
-        label_level=label_level,
-        min_label_cells=min_label_cells,
-        expression_scale=merfish_expression_scale,
-        save_dir=None,
-    )
+        print("[MERFISH 2/4] Using HCR_PANEL_GENES for atlas subsetting...")
+        print(f"  HCR panel genes requested: {len(HCR_PANEL_GENES):,}")
+        print(f"  Expression scale: {merfish_expression_scale}")
 
-    ref_counts = ref_counts.loc[:, ~ref_counts.columns.duplicated()].copy()
-    ref_counts = ref_counts.fillna(0)
-    ref_counts = _subset_to_hcr_panel(ref_counts, HCR_PANEL_GENES)
-    ref_labels = ref_labels.reindex(ref_counts.index)
+        print("[MERFISH 3/4] Loading inhibitory reference counts from ABC Atlas...")
+        ref_counts, ref_labels = atlas_compare.load_abc_merfish_reference(
+            abc_cache_dir=ABC_ATLAS_DIR,
+            genes=HCR_PANEL_GENES,
+            cell_index=v1_cells.index,
+            ref_classes=INHIBITORY_REF_CLASSES,
+            label_level=label_level,
+            min_label_cells=min_label_cells,
+            expression_scale=merfish_expression_scale,
+            save_dir=None,
+        )
+
+        ref_counts = ref_counts.loc[:, ~ref_counts.columns.duplicated()].copy()
+        ref_counts = ref_counts.fillna(0)
+        ref_counts = _subset_to_hcr_panel(ref_counts, HCR_PANEL_GENES)
+        ref_labels = ref_labels.reindex(ref_counts.index)
+
+        _write_parquet(ref_counts, cache_cxg_path)
+        _write_parquet(ref_labels.to_frame(name=label_level), cache_labels_path)
+        print(f"[MERFISH cache] Saved cached matrices -> {cache_dir}")
 
     print(
         f"  Reference matrix: {ref_counts.shape[0]:,} cells x "
@@ -331,6 +380,10 @@ def run_merfish(
             "label_level": label_level,
             "min_label_cells": min_label_cells,
             "expression_scale": merfish_expression_scale,
+            "cache": {
+                "cache_dir": str(cache_dir),
+                "used_cache": used_cache,
+            },
             "hcr_panel_genes": HCR_PANEL_GENES,
             "matrix_shape": [int(ref_counts.shape[0]), int(ref_counts.shape[1])],
             "plot": {
@@ -371,32 +424,65 @@ def run_tasic(
     out_dir = out_root / "tasic"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[TASIC 1/3] Loading VISp Smart-seq expression...")
-    adata_all = cluster_validation_utils.load_visp_expression(
-        SS_PATH,
-        genes=HCR_PANEL_GENES,
-        layer=tasic_layer,
-    )
+    cache_payload = {
+        "dataset": "tasic",
+        "source_path": str(SS_PATH),
+        "tasic_layer": tasic_layer,
+        "panel_genes": HCR_PANEL_GENES,
+        "filter": "inhibitory",
+    }
+    cache_dir = _cache_dir_for("tasic", cache_payload)
+    cache_cxg_path = cache_dir / "cell_x_gene.parquet"
+    cache_meta_path = cache_dir / "cell_metadata.parquet"
+    used_cache = False
 
-    print("[TASIC 2/3] Filtering to inhibitory cells...")
-    views = cluster_validation_utils.make_filtered_views_for_smartseq(adata_all)
-    adata_inh = views["inhibitory"]
-    print(f"  Inhibitory matrix: {adata_inh.n_obs:,} cells x {adata_inh.n_vars:,} genes")
+    cached_cxg = _try_read_parquet(cache_cxg_path)
+    cached_meta = _try_read_parquet(cache_meta_path)
+    if cached_cxg is not None:
+        used_cache = True
+        cxg = cached_cxg.copy()
+        meta_df = cached_meta.copy() if cached_meta is not None else pd.DataFrame(index=cxg.index)
+        print(f"[TASIC cache] Loaded cached matrices from {cache_dir}")
+    else:
+        print("[TASIC 1/3] Loading VISp Smart-seq expression...")
+        adata_all = cluster_validation_utils.load_visp_expression(
+            SS_PATH,
+            genes=HCR_PANEL_GENES,
+            layer=tasic_layer,
+        )
+
+        print("[TASIC 2/3] Filtering to inhibitory cells...")
+        views = cluster_validation_utils.make_filtered_views_for_smartseq(adata_all)
+        adata_inh = views["inhibitory"]
+        print(f"  Inhibitory matrix: {adata_inh.n_obs:,} cells x {adata_inh.n_vars:,} genes")
+
+        X = adata_inh.X if not hasattr(adata_inh.X, "toarray") else adata_inh.X.toarray()
+        cxg = pd.DataFrame(
+            np.asarray(X),
+            index=adata_inh.obs_names.astype(str),
+            columns=adata_inh.var_names.astype(str),
+        )
+        cxg = cxg.fillna(0)
+        cxg = _subset_to_hcr_panel(cxg, HCR_PANEL_GENES)
+
+        obs_cols = [
+            c for c in ["class", "subclass", "cluster", "brain_region", "brain_subregion"]
+            if c in adata_inh.obs.columns
+        ]
+        meta_df = adata_inh.obs.loc[:, obs_cols].copy() if obs_cols else pd.DataFrame(index=cxg.index)
+        meta_df = meta_df.reindex(cxg.index)
+
+        _write_parquet(cxg, cache_cxg_path)
+        _write_parquet(meta_df, cache_meta_path)
+        print(f"[TASIC cache] Saved cached matrices -> {cache_dir}")
+
+        del adata_all, adata_inh, views, X
+        gc.collect()
 
     print("[TASIC 3/3] Writing outputs and clustered PNG...")
-    X = adata_inh.X if not hasattr(adata_inh.X, "toarray") else adata_inh.X.toarray()
-    cxg = pd.DataFrame(
-        np.asarray(X),
-        index=adata_inh.obs_names.astype(str),
-        columns=adata_inh.var_names.astype(str),
-    )
-    cxg = cxg.fillna(0)
-    cxg = _subset_to_hcr_panel(cxg, HCR_PANEL_GENES)
-
     cxg.to_csv(out_dir / "cell_x_gene.csv")
-
-    obs_cols = [c for c in ["class", "subclass", "cluster", "brain_region", "brain_subregion"] if c in adata_inh.obs.columns]
-    adata_inh.obs.loc[:, obs_cols].to_csv(out_dir / "cell_metadata.csv")
+    if not meta_df.empty:
+        meta_df.to_csv(out_dir / "cell_metadata.csv")
 
     _plot_clustered_cellxgene(
         cxg=cxg,
@@ -417,6 +503,10 @@ def run_tasic(
             "source_path": str(SS_PATH),
             "tasic_layer": tasic_layer,
             "filter": "make_filtered_views_for_smartseq()['inhibitory']",
+            "cache": {
+                "cache_dir": str(cache_dir),
+                "used_cache": used_cache,
+            },
             "hcr_panel_genes": HCR_PANEL_GENES,
             "matrix_shape": [int(cxg.shape[0]), int(cxg.shape[1])],
             "plot": {
@@ -432,7 +522,7 @@ def run_tasic(
     )
 
     # Explicitly release large objects.
-    del adata_all, adata_inh, views, cxg, X
+    del cxg, meta_df
     gc.collect()
     print(f"  Saved TASIC outputs -> {out_dir}")
 
@@ -465,33 +555,64 @@ def run_10x_hmb(
     out_dir = out_root / "10x-hmb"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[10x-HMB 1/3] Loading WMB-10X reference counts from ABC Atlas...")
-    print(f"  Region: {tenx_region}")
-    print(f"  Expression scale: {tenx_expression_scale}")
-    if tenx_ref_classes:
-        print(f"  Class filter: {tenx_ref_classes}")
-    if tenx_exclude_supertype_substrings:
-        print(f"  Exclude supertype substrings: {tenx_exclude_supertype_substrings}")
-    if tenx_min_supertype_cells is not None:
-        print(f"  Min supertype cells: {tenx_min_supertype_cells}")
+    cache_payload = {
+        "dataset": "10x-hmb",
+        "region": tenx_region,
+        "expression_scale": tenx_expression_scale,
+        "ref_classes": tenx_ref_classes,
+        "exclude_supertype_substrings": tenx_exclude_supertype_substrings,
+        "min_supertype_cells": tenx_min_supertype_cells,
+        "label_level": label_level,
+        "min_label_cells": int(min_label_cells),
+        "panel_genes": HCR_PANEL_GENES,
+    }
+    cache_dir = _cache_dir_for("10x-hmb", cache_payload)
+    cache_cxg_path = cache_dir / "cell_x_gene.parquet"
+    cache_labels_path = cache_dir / f"labels_{label_level}.parquet"
+    used_cache = False
 
-    ref_counts, ref_labels = atlas_compare.load_abc_wmb_10x_reference(
-        abc_cache_dir=ABC_ATLAS_DIR,
-        genes=HCR_PANEL_GENES,
-        region_of_interest=tenx_region,
-        ref_classes=tenx_ref_classes,
-        exclude_supertype_substrings=tenx_exclude_supertype_substrings,
-        min_supertype_cells=tenx_min_supertype_cells,
-        label_level=label_level,
-        min_label_cells=min_label_cells,
-        expression_scale=tenx_expression_scale,
-        save_dir=None,
-    )
+    cached_cxg = _try_read_parquet(cache_cxg_path)
+    cached_labels = _try_read_parquet(cache_labels_path)
+    if cached_cxg is not None and cached_labels is not None:
+        used_cache = True
+        ref_counts = cached_cxg.copy()
+        if label_level in cached_labels.columns:
+            ref_labels = cached_labels[label_level].copy()
+        else:
+            ref_labels = cached_labels.iloc[:, 0].rename(label_level)
+        print(f"[10x-HMB cache] Loaded cached matrices from {cache_dir}")
+    else:
+        print("[10x-HMB 1/3] Loading WMB-10X reference counts from ABC Atlas...")
+        print(f"  Region: {tenx_region}")
+        print(f"  Expression scale: {tenx_expression_scale}")
+        if tenx_ref_classes:
+            print(f"  Class filter: {tenx_ref_classes}")
+        if tenx_exclude_supertype_substrings:
+            print(f"  Exclude supertype substrings: {tenx_exclude_supertype_substrings}")
+        if tenx_min_supertype_cells is not None:
+            print(f"  Min supertype cells: {tenx_min_supertype_cells}")
 
-    ref_counts = ref_counts.loc[:, ~ref_counts.columns.duplicated()].copy()
-    ref_counts = ref_counts.fillna(0)
-    ref_counts = _subset_to_hcr_panel(ref_counts, HCR_PANEL_GENES)
-    ref_labels = ref_labels.reindex(ref_counts.index)
+        ref_counts, ref_labels = atlas_compare.load_abc_wmb_10x_reference(
+            abc_cache_dir=ABC_ATLAS_DIR,
+            genes=HCR_PANEL_GENES,
+            region_of_interest=tenx_region,
+            ref_classes=tenx_ref_classes,
+            exclude_supertype_substrings=tenx_exclude_supertype_substrings,
+            min_supertype_cells=tenx_min_supertype_cells,
+            label_level=label_level,
+            min_label_cells=min_label_cells,
+            expression_scale=tenx_expression_scale,
+            save_dir=None,
+        )
+
+        ref_counts = ref_counts.loc[:, ~ref_counts.columns.duplicated()].copy()
+        ref_counts = ref_counts.fillna(0)
+        ref_counts = _subset_to_hcr_panel(ref_counts, HCR_PANEL_GENES)
+        ref_labels = ref_labels.reindex(ref_counts.index)
+
+        _write_parquet(ref_counts, cache_cxg_path)
+        _write_parquet(ref_labels.to_frame(name=label_level), cache_labels_path)
+        print(f"[10x-HMB cache] Saved cached matrices -> {cache_dir}")
 
     print(
         f"  Reference matrix: {ref_counts.shape[0]:,} cells x "
@@ -525,6 +646,10 @@ def run_10x_hmb(
             "ref_classes": tenx_ref_classes,
             "exclude_supertype_substrings": tenx_exclude_supertype_substrings,
             "min_supertype_cells": tenx_min_supertype_cells,
+            "cache": {
+                "cache_dir": str(cache_dir),
+                "used_cache": used_cache,
+            },
             "label_level": label_level,
             "min_label_cells": min_label_cells,
             "hcr_panel_genes": HCR_PANEL_GENES,
@@ -567,35 +692,64 @@ def run_hcr(
     out_dir = out_root / "hcr" / str(mouse_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[HCR 1/3] Loading pairwise HCR dataset...")
-    _, pw_ds, _ = get_hcr_dataset_pairwise(
-        mouse_id=mouse_id,
-        data_dir=DATA_DIR,
-        load_spots=False,
-        return_removed=False,
-        coreg_cells_only=False,
-    )
+    cache_payload = {
+        "dataset": "hcr",
+        "mouse_id": str(mouse_id),
+        "data_dir": str(DATA_DIR),
+        "panel_genes": HCR_PANEL_GENES,
+        "source": "load_inhibitory_cells(unmixed=True, all_spots=False)",
+    }
+    cache_dir = _cache_dir_for("hcr", cache_payload)
+    cache_cxg_path = cache_dir / "cell_x_gene.parquet"
+    cache_meta_path = cache_dir / "cell_metadata.parquet"
+    used_cache = False
 
-    print("[HCR 2/3] Loading inhibitory cell×gene matrix...")
-    adata = pw_ds.load_inhibitory_cells(unmixed=True, all_spots=False, as_anndata=True)
-    print(f"  Raw inhibitory matrix: {adata.n_obs:,} cells x {adata.n_vars:,} genes")
+    cached_cxg = _try_read_parquet(cache_cxg_path)
+    cached_meta = _try_read_parquet(cache_meta_path)
+    if cached_cxg is not None:
+        used_cache = True
+        cxg = cached_cxg.copy()
+        meta_df = cached_meta.copy() if cached_meta is not None else pd.DataFrame(index=cxg.index)
+        print(f"[HCR cache] Loaded cached matrices from {cache_dir}")
+    else:
+        print("[HCR 1/3] Loading pairwise HCR dataset...")
+        _, pw_ds, _ = get_hcr_dataset_pairwise(
+            mouse_id=mouse_id,
+            data_dir=DATA_DIR,
+            load_spots=False,
+            return_removed=False,
+            coreg_cells_only=False,
+        )
 
-    X = adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray()
-    cxg = pd.DataFrame(
-        np.asarray(X),
-        index=adata.obs_names.astype(str),
-        columns=adata.var_names.astype(str),
-    ).fillna(0)
+        print("[HCR 2/3] Loading inhibitory cell×gene matrix...")
+        adata = pw_ds.load_inhibitory_cells(unmixed=True, all_spots=False, as_anndata=True)
+        print(f"  Raw inhibitory matrix: {adata.n_obs:,} cells x {adata.n_vars:,} genes")
 
-    cxg = _subset_to_hcr_panel(cxg, HCR_PANEL_GENES)
-    print(f"  Panel-subset matrix: {cxg.shape[0]:,} cells x {cxg.shape[1]:,} genes")
+        X = adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray()
+        cxg = pd.DataFrame(
+            np.asarray(X),
+            index=adata.obs_names.astype(str),
+            columns=adata.var_names.astype(str),
+        ).fillna(0)
+
+        cxg = _subset_to_hcr_panel(cxg, HCR_PANEL_GENES)
+        print(f"  Panel-subset matrix: {cxg.shape[0]:,} cells x {cxg.shape[1]:,} genes")
+
+        obs_cols = [c for c in ["subclass", "cluster", "section", "x", "y"] if c in adata.obs.columns]
+        meta_df = adata.obs.loc[:, obs_cols].copy() if obs_cols else pd.DataFrame(index=cxg.index)
+        meta_df = meta_df.reindex(cxg.index)
+
+        _write_parquet(cxg, cache_cxg_path)
+        _write_parquet(meta_df, cache_meta_path)
+        print(f"[HCR cache] Saved cached matrices -> {cache_dir}")
+
+        del adata, pw_ds, X
+        gc.collect()
 
     print("[HCR 3/3] Writing outputs and clustered PNG...")
     cxg.to_csv(out_dir / "cell_x_gene.csv")
-
-    obs_cols = [c for c in ["subclass", "cluster", "section", "x", "y"] if c in adata.obs.columns]
-    if obs_cols:
-        adata.obs.loc[:, obs_cols].to_csv(out_dir / "cell_metadata.csv")
+    if not meta_df.empty:
+        meta_df.to_csv(out_dir / "cell_metadata.csv")
 
     _plot_clustered_cellxgene(
         cxg=cxg,
@@ -616,6 +770,10 @@ def run_hcr(
             "mouse_id": str(mouse_id),
             "data_dir": str(DATA_DIR),
             "source": "get_hcr_dataset_pairwise + load_inhibitory_cells(unmixed=True, all_spots=False)",
+            "cache": {
+                "cache_dir": str(cache_dir),
+                "used_cache": used_cache,
+            },
             "hcr_panel_genes": HCR_PANEL_GENES,
             "matrix_shape": [int(cxg.shape[0]), int(cxg.shape[1])],
             "plot": {
@@ -631,7 +789,7 @@ def run_hcr(
         },
     )
 
-    del adata, cxg, X
+    del cxg, meta_df
     gc.collect()
     print(f"  Saved HCR outputs -> {out_dir}")
 
