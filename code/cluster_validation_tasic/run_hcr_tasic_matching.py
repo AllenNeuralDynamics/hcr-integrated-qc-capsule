@@ -27,6 +27,7 @@ import pandas as pd
 import anndata as ad
 import scanpy as sc
 import seaborn as sns
+from sklearn.metrics import silhouette_samples, silhouette_score
 
 from aind_hcr_data_loader import get_hcr_dataset_pairwise
 import aind_hcr_qc.viz as viz
@@ -42,7 +43,7 @@ SS_PATH = Path("/root/capsule/scratch/mouse_VISp_gene_expression_matrices_2018-0
 OUT_ROOT = Path("/root/capsule/results/hcr_tasic_matching")
 
 # Mice with confirmed pairwise-unmixed inhibitory cell data
-MOUSE_IDS = ["790322", "782149", "788406"]
+MOUSE_IDS = ["790322", "788406"] # "782149"
 
 # Genes to exclude from the shared panel (non-biological / control)
 EXCLUDE_GENES = {"GFP"}
@@ -311,9 +312,9 @@ def diagnose_batch(hcr_z: ad.AnnData, out_dir: Path) -> None:
 
     plt.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "stage2_01_pre_correction_umap.png", dpi=200, bbox_inches="tight")
+    fig.savefig(out_dir / "01_pre_correction_umap.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {out_dir / 'stage2_01_pre_correction_umap.png'}")
+    print(f"  Saved: {out_dir / '01_pre_correction_umap.png'}")
 
 
 def correct_batch_centering(
@@ -432,9 +433,9 @@ def post_correction_qc(hcr_corrected: ad.AnnData, out_dir: Path) -> None:
                        title=f"Post-correction: {gene}", color_map="magma")
 
     plt.tight_layout()
-    fig.savefig(out_dir / "stage2_02_post_correction_umap.png", dpi=200, bbox_inches="tight")
+    fig.savefig(out_dir / "02_post_correction_umap.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {out_dir / 'stage2_02_post_correction_umap.png'}")
+    print(f"  Saved: {out_dir / '02_post_correction_umap.png'}")
 
 
 def plot_gene_distributions_by_mouse(
@@ -479,7 +480,7 @@ def plot_gene_distributions_by_mouse(
     plt.suptitle("Per-gene distributions by mouse (log-normalized, pre-correction)",
                  fontsize=11, y=1.01)
     plt.tight_layout()
-    fig.savefig(out_dir / "stage2_03_gene_distributions_pre.png", dpi=150, bbox_inches="tight")
+    fig.savefig(out_dir / "03_gene_distributions_pre.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     # --- Post-correction grid ---
@@ -504,7 +505,7 @@ def plot_gene_distributions_by_mouse(
     plt.suptitle("Per-gene distributions by mouse (z-scored, post-correction)",
                  fontsize=11, y=1.01)
     plt.tight_layout()
-    fig.savefig(out_dir / "stage2_04_gene_distributions_post.png", dpi=150, bbox_inches="tight")
+    fig.savefig(out_dir / "04_gene_distributions_post.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     # --- Summary: per-gene cross-mouse Pearson correlation (pre & post) ---
@@ -565,9 +566,9 @@ def plot_gene_distributions_by_mouse(
     plt.suptitle("Batch correction summary: cross-mouse gene-mean correlation",
                  fontsize=11, y=1.02)
     plt.tight_layout()
-    fig.savefig(out_dir / "stage2_05_batch_correlation_summary.png", dpi=200, bbox_inches="tight")
+    fig.savefig(out_dir / "05_batch_correlation_summary.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: stage2_03/04 (grid violins) + stage2_05 (correlation summary)")
+    print(f"  Saved: 03/04 (gene distributions) + 05 (correlation summary)")
 
 
 def plot_platform_comparison(
@@ -631,9 +632,9 @@ def plot_platform_comparison(
 
     plt.suptitle("Cross-platform z-scored centroid comparison (Tasic vs HCR)", fontsize=12, y=1.02)
     plt.tight_layout()
-    fig.savefig(out_dir / "stage1_01_cross_platform_centroids.png", dpi=200, bbox_inches="tight")
+    fig.savefig(out_dir / "01_cross_platform_centroids.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {out_dir / 'stage1_01_cross_platform_centroids.png'}")
+    print(f"  Saved: {out_dir / '01_cross_platform_centroids.png'}")
 
 
 def plot_normalization_summary(
@@ -677,11 +678,11 @@ def plot_normalization_summary(
     axes[1].set_title("HCR dominant-marker centroids (z-scored)")
     axes[1].tick_params(axis="x", rotation=90)
 
-    plt.suptitle("Stage 1 output: z-scored subclass centroids (both platforms)", fontsize=12, y=1.02)
+    plt.suptitle("Data normalization: z-scored subclass centroids (both platforms)", fontsize=12, y=1.02)
     plt.tight_layout()
-    fig.savefig(out_dir / "stage1_02_normalization_summary_heatmaps.png", dpi=200, bbox_inches="tight")
+    fig.savefig(out_dir / "02_normalization_summary_heatmaps.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {out_dir / 'stage1_02_normalization_summary_heatmaps.png'}")
+    print(f"  Saved: {out_dir / '02_normalization_summary_heatmaps.png'}")
 
 
 def plot_composition_by_mouse(hcr_z: ad.AnnData, out_dir: Path) -> None:
@@ -725,9 +726,9 @@ def plot_composition_by_mouse(hcr_z: ad.AnnData, out_dir: Path) -> None:
 
     plt.suptitle("Compositional overlap across mice (batch correction diagnostic)", fontsize=11, y=1.02)
     plt.tight_layout()
-    fig.savefig(out_dir / "stage2_00_composition_by_mouse.png", dpi=200, bbox_inches="tight")
+    fig.savefig(out_dir / "00_composition_by_mouse.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {out_dir / 'stage2_00_composition_by_mouse.png'}")
+    print(f"  Saved: {out_dir / '00_composition_by_mouse.png'}")
 
     # Log the composition table
     print("\n  Subclass composition by mouse (counts):")
@@ -1261,6 +1262,7 @@ def within_branch_leiden_clustering(
     branch_assignments: pd.DataFrame,
     n_neighbors_range: list[int] | None = None,
     resolution_range: list[float] | None = None,
+    min_cells_per_branch_cluster: int = 0,
 ) -> tuple[ad.AnnData, dict]:
     """
     Run Leiden parameter sweep within a single subclass branch on Tasic data.
@@ -1276,6 +1278,10 @@ def within_branch_leiden_clustering(
     branch_assignments : DataFrame
         Output from soft_subclass_gating applied to Tasic cells.
     n_neighbors_range, resolution_range : optional parameter ranges for Leiden.
+    min_cells_per_branch_cluster : int
+        After final clustering, drop Leiden clusters with fewer than this many
+        cells (0 = keep all). Dropped cells are removed from adata_branch so
+        they do not bias downstream centroid computation or matching.
 
     Returns
     -------
@@ -1305,7 +1311,7 @@ def within_branch_leiden_clustering(
     if resolution_range is None:
         resolution_range = [0.3, 0.5, 0.8, 1.0, 1.5, 2.0]
 
-    # Parameter sweep
+    # Parameter sweep: test all param combinations and compute both ARI and silhouette
     sweep_rows = []
     for n_neighbors in n_neighbors_range:
         if n_neighbors >= adata_branch.n_obs:
@@ -1320,11 +1326,23 @@ def within_branch_leiden_clustering(
                 adata_branch.obs["cluster"].astype(str),
                 adata_branch.obs["leiden_test"].astype(str),
             )
+            
+            # Compute silhouette score (cluster tightness in gene expression space)
+            n_clusters_test = adata_branch.obs["leiden_test"].nunique()
+            if n_clusters_test > 1 and n_clusters_test < adata_branch.n_obs:
+                silhouette = silhouette_score(
+                    adata_branch.X,
+                    adata_branch.obs["leiden_test"].astype(str).values
+                )
+            else:
+                silhouette = np.nan
+            
             sweep_rows.append({
                 "n_neighbors": n_neighbors,
                 "resolution": resolution,
                 "ari": ari,
-                "n_clusters": adata_branch.obs["leiden_test"].nunique(),
+                "silhouette": silhouette,
+                "n_clusters": n_clusters_test,
             })
 
     sweep_df = pd.DataFrame(sweep_rows).sort_values("ari", ascending=False).reset_index(drop=True)
@@ -1341,6 +1359,22 @@ def within_branch_leiden_clustering(
     adata_branch.obs["branch_cluster"] = [
         f"{branch}-{lid}" for lid in adata_branch.obs["leiden"].values
     ]
+
+    # Drop underpopulated branch clusters if threshold is set
+    if min_cells_per_branch_cluster > 0:
+        cluster_counts = adata_branch.obs["branch_cluster"].value_counts()
+        keep_clusters = cluster_counts[cluster_counts >= min_cells_per_branch_cluster].index
+        n_before = adata_branch.n_obs
+        n_clusters_before = cluster_counts.shape[0]
+        adata_branch = adata_branch[
+            adata_branch.obs["branch_cluster"].isin(keep_clusters)
+        ].copy()
+        n_dropped_clusters = n_clusters_before - len(keep_clusters)
+        n_dropped_cells = n_before - adata_branch.n_obs
+        if n_dropped_clusters > 0:
+            print(f"      Dropped {n_dropped_clusters} branch cluster(s) with "
+                  f"< {min_cells_per_branch_cluster} cells "
+                  f"({n_dropped_cells} cells removed)")
 
     n_clusters = adata_branch.obs["leiden"].nunique()
     print(f"      Best params: n_neighbors={best_n}, resolution={best_r:.1f}, "
@@ -1528,6 +1562,122 @@ def plot_stage4_diagnostics(
     print(f"  Saved: stage4_01-03 diagnostic plots")
 
 
+def plot_silhouette_vs_ari_sweep(
+    sweep_df: pd.DataFrame,
+    branch: str,
+    out_dir: Path,
+) -> None:
+    """
+    Plot silhouette score and ARI side-by-side across parameter sweep.
+    
+    Helps visualize whether high ARI correlates with cluster tightness
+    or if there's a trade-off that shouldn't be ignored.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Left: ARI sorted heatmap
+    sweep_pivot_ari = sweep_df.pivot(index="resolution", columns="n_neighbors", values="ari")
+    sns.heatmap(sweep_pivot_ari, annot=True, fmt=".3f", cmap="RdYlGn", 
+                ax=axes[0], cbar_kws={"label": "ARI"}, vmin=0, vmax=1)
+    axes[0].set_title(f"{branch}: ARI (Leiden vs. original Tasic labels)")
+    axes[0].set_xlabel("n_neighbors")
+    axes[0].set_ylabel("resolution")
+    
+    # Right: Silhouette heatmap (only if available)
+    if "silhouette" in sweep_df.columns and sweep_df["silhouette"].notna().any():
+        sweep_pivot_sil = sweep_df.pivot(index="resolution", columns="n_neighbors", values="silhouette")
+        sns.heatmap(sweep_pivot_sil, annot=True, fmt=".3f", cmap="coolwarm", 
+                    ax=axes[1], cbar_kws={"label": "Silhouette"}, center=0)
+        axes[1].set_title(f"{branch}: Silhouette (cluster tightness)")
+    else:
+        axes[1].text(0.5, 0.5, "Silhouette data unavailable", 
+                     ha="center", va="center", transform=axes[1].transAxes)
+        axes[1].set_title(f"{branch}: Silhouette (cluster tightness)")
+    
+    axes[1].set_xlabel("n_neighbors")
+    axes[1].set_ylabel("resolution")
+    
+    plt.tight_layout()
+    out_path = out_dir / f"stage4_sweep_ari_silhouette_{branch.lower()}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"    Saved: {out_path.name}")
+
+
+def extract_top_markers_per_cluster(
+    adata: ad.AnnData,
+    cluster_col: str = "leiden",
+    n_top: int = 5,
+) -> pd.DataFrame:
+    """
+    Extract top discriminable genes per cluster (one-vs-rest effect size).
+    
+    Returns DataFrame with cluster, gene, effect_size (mean fold-change in z-scores).
+    """
+    clusters = adata.obs[cluster_col].unique()
+    X_z = adata.X  # Already z-scored
+    
+    markers = []
+    for cluster in sorted(clusters):
+        in_cluster = adata.obs[cluster_col] == cluster
+        out_cluster = ~in_cluster
+        
+        for gene_idx, gene_name in enumerate(adata.var_names):
+            in_expr = X_z[in_cluster, gene_idx]
+            out_expr = X_z[out_cluster, gene_idx]
+            
+            fold_change = in_expr.mean() - out_expr.mean()
+            markers.append({
+                "cluster": cluster,
+                "gene": gene_name,
+                "effect_size": fold_change,
+            })
+    
+    markers_df = pd.DataFrame(markers)
+    
+    # Keep top n per cluster
+    top_markers = (
+        markers_df
+        .sort_values("effect_size", ascending=False, key=abs)
+        .groupby("cluster", group_keys=False)
+        .head(n_top)
+        .sort_values(["cluster", "effect_size"], ascending=[True, False])
+    )
+    return top_markers
+
+
+def print_sweep_summary(
+    sweep_df: pd.DataFrame,
+    branch: str,
+    top_n: int = 5,
+) -> None:
+    """
+    Print a summary of sweep results ranked by different metrics.
+    """
+    print(f"\n    === Sweep Summary for {branch} ===")
+    print(f"    Tested {len(sweep_df)} parameter combinations")
+    
+    # Top by ARI
+    top_ari = sweep_df.nlargest(top_n, "ari")[
+        ["n_neighbors", "resolution", "ari", "n_clusters", "silhouette"]
+    ]
+    print(f"\n    Top {top_n} by ARI (taxonomy agreement):")
+    for i, row in top_ari.iterrows():
+        sil_str = f"silhouette={row['silhouette']:.3f}" if pd.notna(row['silhouette']) else "silhouette=N/A"
+        print(f"      n_neighbors={int(row['n_neighbors']):2d}, resolution={row['resolution']:.1f} → "
+              f"ARI={row['ari']:.3f}, n_clusters={int(row['n_clusters']):2d}, {sil_str}")
+    
+    # Top by silhouette (if available)
+    if sweep_df["silhouette"].notna().any():
+        top_sil = sweep_df.nlargest(top_n, "silhouette")[
+            ["n_neighbors", "resolution", "ari", "n_clusters", "silhouette"]
+        ]
+        print(f"\n    Top {top_n} by Silhouette (cluster tightness):")
+        for i, row in top_sil.iterrows():
+            print(f"      n_neighbors={int(row['n_neighbors']):2d}, resolution={row['resolution']:.1f} → "
+                  f"silhouette={row['silhouette']:.3f}, ARI={row['ari']:.3f}, n_clusters={int(row['n_clusters']):2d}")
+
+
 def run_stage4(
     tasic_z: ad.AnnData,
     hcr_corrected: ad.AnnData,
@@ -1536,6 +1686,7 @@ def run_stage4(
     confidence_threshold: float = 0.5,
     margin_threshold: float = 0.2,
     n_bootstraps: int = 20,
+    min_cells_per_branch_cluster: int = 0,
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     """
     Execute Stage 4: Approach C supervised hierarchical clustering.
@@ -1562,6 +1713,9 @@ def run_stage4(
         Min gap between top and second probability.
     n_bootstraps : int
         Number of bootstrap iterations for stability.
+    min_cells_per_branch_cluster : int
+        Drop Leiden clusters within each branch that have fewer than this many
+        Tasic cells after final clustering (0 = keep all).
 
     Returns
     -------
@@ -1647,6 +1801,7 @@ def run_stage4(
         print(f"\n  --- Branch: {branch} ---")
         adata_branch, res_dict = within_branch_leiden_clustering(
             tasic_z, branch, tasic_gating,
+            min_cells_per_branch_cluster=min_cells_per_branch_cluster,
         )
 
         if res_dict.get("skip"):
@@ -1654,6 +1809,11 @@ def run_stage4(
             continue
 
         branch_results[branch] = (adata_branch, res_dict)
+
+        # 4.2b Print sweep summary and plot silhouette vs ARI
+        sweep_df = res_dict["sweep_df"]
+        print_sweep_summary(sweep_df, branch, top_n=3)
+        plot_silhouette_vs_ari_sweep(sweep_df, branch, stage4_dir)
 
         # 4.3 Bootstrap stability
         print(f"    Running bootstrap stability ({n_bootstraps} iterations)...")
@@ -2266,8 +2426,437 @@ def run_stage5(
             branch_marker_names, stage5_dir,
         )
 
+    # -------------------------------------------------------------------------
+    # 5.7 Residual analysis
+    # -------------------------------------------------------------------------
+    if hcr_assignments_c is not None:
+        print(f"\n[5.7] Computing residual analysis (cell vs assigned centroid)...")
+        _compute_residual_analysis(hcr_corrected, hcr_assignments_c, stage5_dir)
+
+    # -------------------------------------------------------------------------
+    # 5.8 Clustering quality: R² and silhouette
+    # -------------------------------------------------------------------------
+    if hcr_assignments_c is not None:
+        print(f"\n[5.8] Computing clustering quality (R² and silhouette scores)...")
+        _compute_clustering_quality(hcr_corrected, hcr_assignments_c, stage5_dir)
+
     print(f"\n  Stage 5 complete. Outputs in {stage5_dir}")
     return hcr_assignments_a, hcr_assignments_c
+
+
+def _compute_clustering_quality(
+    hcr_corrected: ad.AnnData,
+    hcr_assignments_c: pd.DataFrame,
+    out_dir: Path,
+) -> None:
+    """
+    Assess how well the Tasic-derived cluster labels explain variance in HCR data.
+
+    Three complementary metrics, computed per mouse and globally:
+
+    1. R² (variance explained)
+       R² = SS_between / SS_total = 1 - SS_within / SS_total
+       Global single number + per-gene breakdown showing which genes are
+       well-structured by the labels vs. which are noisy.
+
+    2. Per-gene R² ranked barplot
+       One-way ANOVA decomposition per gene: genes ranked most → least
+       explained by the cluster assignment.
+
+    3. Silhouette scores
+       Per-cell: how similar is each cell to its own cluster vs. the nearest
+       alternative cluster? Score in [-1, 1].
+       Summarised as violin per cluster to show which clusters are
+       well-separated vs. ambiguous.
+
+    Outputs per mouse in mouse_{id}/:
+        clustering_quality_summary.csv
+        clustering_quality_overview.png   (3-panel figure)
+    """
+    genes = list(hcr_corrected.var_names)
+    n_genes = len(genes)
+    X = hcr_corrected.X if not hasattr(hcr_corrected.X, "toarray") else hcr_corrected.X.toarray()
+    X = np.asarray(X, dtype=np.float64)
+    cell_df = pd.DataFrame(X, columns=genes, index=hcr_corrected.obs_names)
+
+    assignment_map = hcr_assignments_c.set_index("cell_id")["assignment"]
+    mice = sorted(hcr_corrected.obs["mouse_id"].unique())
+
+    # Global summary rows accumulated across mice
+    global_rows = []
+
+    for mouse in mice:
+        mouse_mask = hcr_corrected.obs["mouse_id"] == mouse
+        mouse_cell_ids = hcr_corrected.obs_names[mouse_mask]
+        assigned_ids = mouse_cell_ids[mouse_cell_ids.isin(assignment_map.index)]
+        if len(assigned_ids) < 4:
+            continue
+
+        mouse_dir = out_dir / f"mouse_{mouse}"
+        mouse_dir.mkdir(parents=True, exist_ok=True)
+
+        X_m = cell_df.loc[assigned_ids].values          # (n_cells, n_genes)
+        labels_m = assignment_map.loc[assigned_ids].values
+        unique_labels = sorted(set(labels_m))
+        n_cells = X_m.shape[0]
+        n_clusters = len(unique_labels)
+
+        # ---------------------------------------------------------------
+        # 1 & 2. R²: global + per gene
+        # ---------------------------------------------------------------
+        grand_mean = X_m.mean(axis=0)                   # (n_genes,)
+        ss_total = ((X_m - grand_mean) ** 2).sum(axis=0)  # per gene
+
+        # Build label index array once
+        label_index = np.array([unique_labels.index(l) for l in labels_m])
+
+        # Centroid for each cluster per gene
+        centroids = np.zeros((n_clusters, n_genes))
+        for ci, label in enumerate(unique_labels):
+            mask_ci = label_index == ci
+            centroids[ci] = X_m[mask_ci].mean(axis=0)
+
+        ss_within = ((X_m - centroids[label_index]) ** 2).sum(axis=0)  # per gene
+        ss_between = ss_total - ss_within
+
+        # Guard against zero-variance genes
+        r2_per_gene = np.where(ss_total > 1e-12, ss_between / ss_total, 0.0)
+        global_r2 = float(ss_between.sum() / ss_total.sum()) if ss_total.sum() > 0 else 0.0
+
+        gene_r2_df = pd.DataFrame({
+            "gene": genes,
+            "r2": r2_per_gene,
+        }).sort_values("r2", ascending=False).reset_index(drop=True)
+
+        # ---------------------------------------------------------------
+        # 3. Silhouette scores
+        # ---------------------------------------------------------------
+        # Skip if only 1 cluster or too few cells per cluster
+        can_silhouette = n_clusters >= 2 and n_cells >= 2 * n_clusters
+        if can_silhouette:
+            sil_scores = silhouette_samples(X_m, labels_m)
+            sil_df = pd.DataFrame({
+                "cell_id": assigned_ids,
+                "assignment": labels_m,
+                "silhouette": sil_scores,
+            })
+            mean_sil = float(sil_scores.mean())
+        else:
+            sil_df = pd.DataFrame(columns=["cell_id", "assignment", "silhouette"])
+            mean_sil = float("nan")
+            print(f"    Mouse {mouse}: silhouette skipped "
+                  f"(n_clusters={n_clusters}, n_cells={n_cells})")
+
+        global_rows.append({
+            "mouse_id": mouse,
+            "n_cells": n_cells,
+            "n_clusters": n_clusters,
+            "global_r2": round(global_r2, 4),
+            "mean_silhouette": round(mean_sil, 4) if not np.isnan(mean_sil) else "NA",
+            "best_explained_gene": gene_r2_df.iloc[0]["gene"],
+            "worst_explained_gene": gene_r2_df.iloc[-1]["gene"],
+        })
+
+        # ---------------------------------------------------------------
+        # Figure: 3-panel overview
+        # ---------------------------------------------------------------
+        has_sil = can_silhouette and len(sil_df) > 0
+        n_panels = 3 if has_sil else 2
+        fig, axes = plt.subplots(
+            1, n_panels,
+            figsize=(5 * n_panels, max(4, n_genes * 0.35)),
+            gridspec_kw={"width_ratios": [1.4, 1, 1][:n_panels]},
+        )
+
+        # Panel 1: Per-gene R² barplot (horizontal, ranked)
+        ax = axes[0]
+        r2_sorted = gene_r2_df["r2"].values
+        gene_sorted = gene_r2_df["gene"].values
+        bar_colors = plt.cm.RdYlGn(r2_sorted)  # green=high R², red=low
+        ax.barh(range(n_genes), r2_sorted, color=bar_colors, edgecolor="black", linewidth=0.4)
+        ax.set_yticks(range(n_genes))
+        ax.set_yticklabels(gene_sorted, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel("R² (variance explained by cluster)", fontsize=9)
+        ax.set_xlim(0, 1)
+        ax.axvline(0.5, color="grey", linestyle="--", linewidth=1, alpha=0.6)
+        ax.set_title(
+            f"Per-gene R²\nGlobal R² = {global_r2:.3f}",
+            fontsize=10, fontweight="bold",
+        )
+        for i, (gene, r2) in enumerate(zip(gene_sorted, r2_sorted)):
+            ax.text(r2 + 0.02, i, f"{r2:.2f}", va="center", fontsize=7)
+        ax.grid(axis="x", alpha=0.3)
+
+        # Panel 2: Per-cluster mean R² barplot
+        ax = axes[1]
+        cluster_r2 = {}
+        for ci, label in enumerate(unique_labels):
+            mask_ci = label_index == ci
+            ss_t_cl = ((X_m[mask_ci] - grand_mean) ** 2).sum()
+            ss_w_cl = ((X_m[mask_ci] - centroids[ci]) ** 2).sum()
+            cluster_r2[label] = float((ss_t_cl - ss_w_cl) / ss_t_cl) if ss_t_cl > 1e-12 else 0.0
+        sorted_clusters = sorted(cluster_r2, key=cluster_r2.get, reverse=True)
+        cl_r2_vals = [cluster_r2[cl] for cl in sorted_clusters]
+        cl_colors = plt.cm.RdYlGn(np.array(cl_r2_vals))
+        ax.barh(range(len(sorted_clusters)), cl_r2_vals, color=cl_colors,
+                edgecolor="black", linewidth=0.4)
+        ax.set_yticks(range(len(sorted_clusters)))
+        ax.set_yticklabels(sorted_clusters, fontsize=7)
+        ax.invert_yaxis()
+        ax.set_xlabel("R² (cluster vs grand mean)", fontsize=9)
+        ax.set_xlim(0, 1)
+        ax.axvline(0.5, color="grey", linestyle="--", linewidth=1, alpha=0.6)
+        ax.set_title("Per-cluster R²", fontsize=10, fontweight="bold")
+        ax.grid(axis="x", alpha=0.3)
+
+        # Panel 3: Silhouette violin per cluster
+        if has_sil:
+            ax = axes[2]
+            sil_by_cluster = [
+                sil_df.loc[sil_df["assignment"] == lbl, "silhouette"].values
+                for lbl in sorted_clusters
+                if (sil_df["assignment"] == lbl).any()
+            ]
+            present_labels = [
+                lbl for lbl in sorted_clusters
+                if (sil_df["assignment"] == lbl).any()
+            ]
+            parts = ax.violinplot(
+                sil_by_cluster,
+                vert=False,
+                showmedians=True,
+                showextrema=True,
+            )
+            for pc, color in zip(parts["bodies"], cl_colors):
+                pc.set_facecolor(color)
+                pc.set_alpha(0.7)
+            ax.set_yticks(range(1, len(present_labels) + 1))
+            ax.set_yticklabels(present_labels, fontsize=7)
+            ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+            ax.axvline(0.5, color="green", linewidth=0.8, linestyle=":", alpha=0.6)
+            ax.set_xlabel("Silhouette score", fontsize=9)
+            ax.set_xlim(-1, 1)
+            ax.set_title(
+                f"Silhouette per cluster\nMean = {mean_sil:.3f}",
+                fontsize=10, fontweight="bold",
+            )
+            ax.grid(axis="x", alpha=0.3)
+
+        plt.suptitle(
+            f"Mouse {mouse}: Clustering quality  "
+            f"(n={n_cells} cells, {n_clusters} clusters)",
+            fontsize=11, fontweight="bold",
+        )
+        plt.tight_layout()
+        fig.savefig(mouse_dir / "clustering_quality_overview.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        # Save CSVs
+        gene_r2_df.to_csv(mouse_dir / "clustering_r2_per_gene.csv", index=False)
+        pd.DataFrame({
+            "cluster": list(cluster_r2.keys()),
+            "r2": list(cluster_r2.values()),
+        }).sort_values("r2", ascending=False).to_csv(
+            mouse_dir / "clustering_r2_per_cluster.csv", index=False
+        )
+        if has_sil:
+            sil_df.to_csv(mouse_dir / "clustering_silhouette.csv", index=False)
+
+        print(f"    Mouse {mouse}: global R²={global_r2:.3f}, "
+              f"mean silhouette={mean_sil:.3f} "
+              f"({n_cells} cells, {n_clusters} clusters)")
+
+    # Save cross-mouse summary
+    if global_rows:
+        pd.DataFrame(global_rows).to_csv(
+            out_dir / "clustering_quality_summary.csv", index=False
+        )
+        print(f"  Cross-mouse quality summary saved to {out_dir / 'clustering_quality_summary.csv'}")
+
+
+def _compute_residual_analysis(
+    hcr_corrected: ad.AnnData,
+    hcr_assignments_c: pd.DataFrame,
+    out_dir: Path,
+) -> None:
+    """
+    Compute per-cell residuals (cell z-score - assigned centroid z-score) and
+    summarize in three diagnostics saved per mouse:
+
+    1. Residual std heatmap (gene × cluster): which (gene, cluster) combinations
+       show the highest spread across assigned cells.
+    2. Ranked gene instability barplot: genes ranked by their mean residual std
+       pooled across all clusters.
+    3. Per-cell residual norm plot: ||cell - centroid||_2 sorted descending,
+       revealing outlier / potentially misclassified cells.
+
+    Uses z-scored HCR data (hcr_corrected.X) and assignment-derived centroids.
+    """
+    genes = list(hcr_corrected.var_names)
+    n_genes = len(genes)
+    X = hcr_corrected.X if not hasattr(hcr_corrected.X, "toarray") else hcr_corrected.X.toarray()
+    X = np.asarray(X, dtype=np.float64)
+    cell_df = pd.DataFrame(X, columns=genes, index=hcr_corrected.obs_names)
+
+    assignment_map = hcr_assignments_c.set_index("cell_id")["assignment"]
+    mice = sorted(hcr_corrected.obs["mouse_id"].unique())
+
+    # Compute per-assignment centroids from hcr_corrected (z-scored)
+    # (same space as individual cells, so residuals are directly interpretable)
+    assigned_cells_all = hcr_corrected.obs_names[hcr_corrected.obs_names.isin(assignment_map.index)]
+    cell_df_assigned = cell_df.loc[assigned_cells_all].copy()
+    cell_df_assigned["_assignment"] = assignment_map.loc[assigned_cells_all].values
+    centroids = cell_df_assigned.groupby("_assignment")[genes].mean()
+
+    # Compute residual for every assigned cell: cell - its centroid
+    residuals = cell_df_assigned[genes].values - centroids.loc[
+        cell_df_assigned["_assignment"].values
+    ].values  # shape: (n_cells, n_genes)
+    residual_df = pd.DataFrame(
+        residuals, columns=genes, index=assigned_cells_all
+    )
+    residual_df["_assignment"] = cell_df_assigned["_assignment"].values
+    residual_df["_mouse"] = hcr_corrected.obs.loc[assigned_cells_all, "mouse_id"].values
+
+    # Global gene instability (std of residuals per gene, pooled across all cells)
+    gene_std_global = residual_df[genes].std(axis=0).sort_values(ascending=False)
+
+    for mouse in mice:
+        mouse_mask = residual_df["_mouse"] == mouse
+        if mouse_mask.sum() == 0:
+            continue
+
+        mouse_dir = out_dir / f"mouse_{mouse}"
+        mouse_dir.mkdir(parents=True, exist_ok=True)
+
+        res_mouse = residual_df[mouse_mask]
+        assignments_mouse = res_mouse["_assignment"]
+        labels_present = sorted(assignments_mouse.unique())
+
+        # ------------------------------------------------------------------
+        # 1. Residual std heatmap: gene × cluster
+        # ------------------------------------------------------------------
+        # For each (gene, cluster): std of residuals across all cells in that cluster
+        std_rows = {}
+        for label in labels_present:
+            mask_cl = assignments_mouse == label
+            if mask_cl.sum() < 2:
+                std_rows[label] = np.zeros(n_genes)
+            else:
+                std_rows[label] = res_mouse.loc[mask_cl, genes].std(axis=0).values
+        std_matrix = pd.DataFrame(std_rows, index=genes).T  # clusters × genes
+        std_matrix = std_matrix.reindex(labels_present)
+
+        # Gene instability for this mouse (mean std across clusters)
+        gene_std_mouse = std_matrix.mean(axis=0).sort_values(ascending=False)
+
+        # Reorder columns by global instability rank for consistent gene ordering
+        gene_order = gene_std_global.index.tolist()
+        std_matrix_ordered = std_matrix[gene_order]
+
+        fig_h, ax_h = plt.subplots(
+            figsize=(max(6, n_genes * 0.5), max(4, len(labels_present) * 0.35))
+        )
+        im = ax_h.imshow(
+            std_matrix_ordered.values,
+            aspect="auto",
+            cmap="YlOrRd",
+            vmin=0,
+        )
+        ax_h.set_xticks(range(n_genes))
+        ax_h.set_xticklabels(gene_order, rotation=90, fontsize=8)
+        ax_h.set_yticks(range(len(labels_present)))
+        ax_h.set_yticklabels(labels_present, fontsize=7)
+        ax_h.set_xlabel("Gene (ranked by instability ▶)", fontsize=9)
+        ax_h.set_title(
+            f"Mouse {mouse}: Residual std per (gene, cluster)\n"
+            "Genes ranked left→right by pooled instability",
+            fontsize=10,
+        )
+        plt.colorbar(im, ax=ax_h, label="Residual std (z-score units)")
+        plt.tight_layout()
+        fig_h.savefig(mouse_dir / "residual_std_heatmap.png", dpi=150, bbox_inches="tight")
+        plt.close(fig_h)
+
+        # ------------------------------------------------------------------
+        # 2. Ranked gene instability barplot
+        # ------------------------------------------------------------------
+        fig_b, ax_b = plt.subplots(figsize=(max(6, n_genes * 0.5), 4))
+        bar_colors = plt.cm.YlOrRd(
+            (gene_std_mouse.loc[gene_order] - gene_std_mouse.min()) /
+            (gene_std_mouse.max() - gene_std_mouse.min() + 1e-12)
+        )
+        ax_b.bar(range(n_genes), gene_std_mouse.loc[gene_order].values, color=bar_colors,
+                 edgecolor="black", linewidth=0.4)
+        ax_b.set_xticks(range(n_genes))
+        ax_b.set_xticklabels(gene_order, rotation=90, fontsize=8)
+        ax_b.set_ylabel("Mean residual std across clusters", fontsize=9)
+        ax_b.set_title(
+            f"Mouse {mouse}: Gene instability (ranked most → least deviant)",
+            fontsize=10,
+        )
+        ax_b.grid(axis="y", alpha=0.3)
+        plt.tight_layout()
+        fig_b.savefig(mouse_dir / "residual_gene_instability.png", dpi=150, bbox_inches="tight")
+        plt.close(fig_b)
+
+        # ------------------------------------------------------------------
+        # 3. Per-cell residual norm plot (outlier detection)
+        # ------------------------------------------------------------------
+        cell_norms = np.linalg.norm(res_mouse[genes].values, axis=1)
+        sort_idx = np.argsort(cell_norms)[::-1]
+        sorted_norms = cell_norms[sort_idx]
+        sorted_assignments = assignments_mouse.iloc[sort_idx].values
+        sorted_cell_ids = res_mouse.index[sort_idx]
+        n_cells = len(sorted_norms)
+
+        # Color bars by cluster assignment
+        unique_labels = sorted(set(sorted_assignments))
+        cmap_disc = plt.cm.get_cmap("tab20", len(unique_labels))
+        label_to_color = {lbl: cmap_disc(i) for i, lbl in enumerate(unique_labels)}
+        bar_cell_colors = [label_to_color[a] for a in sorted_assignments]
+
+        fig_n, ax_n = plt.subplots(figsize=(max(8, n_cells * 0.04), 4))
+        ax_n.bar(range(n_cells), sorted_norms, color=bar_cell_colors, linewidth=0)
+        # Mark the 90th-percentile threshold
+        p90 = np.percentile(sorted_norms, 90)
+        ax_n.axhline(p90, color="red", linestyle="--", linewidth=1,
+                     label=f"90th percentile ({p90:.2f})")
+        ax_n.set_xlabel(f"Cells ranked by residual norm (n={n_cells})", fontsize=9)
+        ax_n.set_ylabel("||cell − centroid||₂", fontsize=9)
+        ax_n.set_title(
+            f"Mouse {mouse}: Per-cell residual norms (sorted, colored by assignment)",
+            fontsize=10,
+        )
+        ax_n.legend(fontsize=8)
+        # Compact cluster legend
+        legend_patches = [
+            plt.matplotlib.patches.Patch(color=label_to_color[lbl], label=lbl)
+            for lbl in unique_labels
+        ]
+        ax_n.legend(handles=legend_patches, fontsize=6, ncol=2,
+                    loc="upper right", title="Assignment")
+        plt.tight_layout()
+        fig_n.savefig(mouse_dir / "residual_cell_norms.png", dpi=150, bbox_inches="tight")
+        plt.close(fig_n)
+
+        # ------------------------------------------------------------------
+        # Save CSVs
+        # ------------------------------------------------------------------
+        std_matrix.to_csv(mouse_dir / "residual_std_by_gene_cluster.csv")
+        pd.DataFrame({
+            "gene": gene_order,
+            "mean_residual_std": gene_std_mouse.loc[gene_order].values,
+        }).to_csv(mouse_dir / "residual_gene_instability.csv", index=False)
+        pd.DataFrame({
+            "cell_id": sorted_cell_ids,
+            "assignment": sorted_assignments,
+            "residual_norm": sorted_norms,
+        }).to_csv(mouse_dir / "residual_cell_norms.csv", index=False)
+
+        print(f"    Mouse {mouse}: residual analysis saved to {mouse_dir} "
+              f"({n_cells} cells, {len(labels_present)} clusters)")
 
 
 def _plot_hcr_cellxgene_per_mouse(
@@ -2277,13 +2866,41 @@ def _plot_hcr_cellxgene_per_mouse(
 ) -> None:
     """
     For each mouse, plot a cell×gene heatmap ordered by Leiden-named assignments.
-    Uses viz.plot_cell_x_gene_labeled.
+    Uses raw counts (clipped 0-200), not z-scored values.
+    Saves results into per-mouse subfolders.
     """
+    # Load raw counts from hcr_log (saved during Stage 1 normalization)
+    hcr_log_path = out_dir.parent / "hcr_log.h5ad"
+    print(f"    Loading raw counts from {hcr_log_path}...")
+    hcr_log = ad.read_h5ad(hcr_log_path)
+    
+    # Get raw counts for the same cells in hcr_corrected
+    # hcr_log.layers["raw"] contains the raw counts before log1p
+    X_raw = hcr_log.layers["raw"]
+    if hasattr(X_raw, "toarray"):
+        X_raw = X_raw.toarray()
+    X_raw = np.asarray(X_raw, dtype=np.float64)
+    
+    # hcr_log and hcr_corrected should have the same cells in the same order
+    # But we'll verify by matching on cell names to be safe
+    assert len(hcr_log.obs_names) == len(hcr_corrected.obs_names), \
+        f"Cell count mismatch: hcr_log={len(hcr_log.obs_names)}, hcr_corrected={len(hcr_corrected.obs_names)}"
+    
+    # Check if cells are in same order
+    if all(hcr_log.obs_names == hcr_corrected.obs_names):
+        # Cells already aligned, just need to reorder genes
+        gene_indices = [np.where(hcr_log.var_names == g)[0][0] for g in hcr_corrected.var_names]
+        X_raw = X_raw[:, gene_indices]
+    else:
+        # Need to reorder both genes and cells
+        cell_indices = [np.where(hcr_log.obs_names == cid)[0][0] for cid in hcr_corrected.obs_names]
+        gene_indices = [np.where(hcr_log.var_names == g)[0][0] for g in hcr_corrected.var_names]
+        X_raw = X_raw[np.ix_(cell_indices, gene_indices)]
+    
+    cxg_all = pd.DataFrame(X_raw, columns=hcr_corrected.var_names, index=hcr_corrected.obs_names)
+    
     assignment_map = hcr_assignments_c.set_index("cell_id")["assignment"]
     mice = sorted(hcr_corrected.obs["mouse_id"].unique())
-
-    X = hcr_corrected.X if not hasattr(hcr_corrected.X, "toarray") else hcr_corrected.X.toarray()
-    cxg_all = pd.DataFrame(X, columns=hcr_corrected.var_names, index=hcr_corrected.obs_names)
 
     for mouse in mice:
         mouse_mask = hcr_corrected.obs["mouse_id"] == mouse
@@ -2293,22 +2910,30 @@ def _plot_hcr_cellxgene_per_mouse(
         if len(assigned_cells) == 0:
             continue
 
+        # Create mouse-specific subdirectory
+        mouse_dir = out_dir / f"mouse_{mouse}"
+        mouse_dir.mkdir(parents=True, exist_ok=True)
+
         cxg_mouse = cxg_all.loc[assigned_cells]
         labels_mouse = assignment_map.loc[assigned_cells]
 
         fig, _, _ = viz.plot_cell_x_gene_labeled(
             cxg_mouse,
             labels=labels_mouse,
-            clip_range=(-2.5, 2.5),
+            clip_range=(0, 200),
             fig_size=(8, max(6, len(assigned_cells) * 0.003)),
             label_fontsize=7,
-            cbar_label="z-score",
+            cbar_label="raw count",
             title=f"Mouse {mouse}: HCR cells by Leiden-named assignment ({len(assigned_cells)} cells)",
         )
-        fig.savefig(out_dir / f"stage5_cellxgene_mouse_{mouse}.png",
+        fig.savefig(mouse_dir / "cellxgene_labeled.png",
                     dpi=100, bbox_inches="tight")
         plt.close(fig)
-        print(f"    Mouse {mouse}: cell×gene plot saved ({len(assigned_cells)} cells)")
+        
+        # Also save the raw data as CSV for downstream analysis
+        cxg_mouse.to_csv(mouse_dir / "cellxgene_raw_counts.csv")
+        
+        print(f"    Mouse {mouse}: results saved to {mouse_dir} ({len(assigned_cells)} cells)")
 
 
 def _plot_mean_expression_summary(
@@ -2322,6 +2947,7 @@ def _plot_mean_expression_summary(
     """
     Summary figure: mean gene expression per Leiden-named label.
     Subplots: one per mouse + one for Tasic reference.
+    Also creates per-mouse summary heatmaps and saves centroids to CSV.
     """
     genes = list(hcr_corrected.var_names)
     mice = sorted(hcr_corrected.obs["mouse_id"].unique())
@@ -2362,6 +2988,7 @@ def _plot_mean_expression_summary(
     # Use sorted label order from Tasic for consistent ordering
     all_labels = sorted(tasic_centroids.index.tolist())
 
+    # Create combined summary panel
     n_panels = len(mouse_centroids) + 1  # mice + Tasic
     fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, max(5, len(all_labels) * 0.3)))
     if n_panels == 1:
@@ -2396,6 +3023,101 @@ def _plot_mean_expression_summary(
     fig.savefig(out_dir / "stage5_04_mean_expression_summary.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"    Mean expression summary saved ({n_panels} panels)")
+
+    # Create per-mouse individual summary plots and save centroids
+    for mouse in mice:
+        if mouse not in mouse_centroids:
+            continue
+        
+        # Create mouse-specific subdirectory
+        mouse_dir = out_dir / f"mouse_{mouse}"
+        mouse_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Get data for this mouse aligned with all_labels
+        tasic_data = tasic_centroids.reindex(all_labels).fillna(0)
+        mouse_data = mouse_centroids[mouse].reindex(all_labels).fillna(0)
+        diff_data = mouse_data - tasic_data
+        
+        # Compute per-cluster Pearson correlations
+        correlations = []
+        for label in all_labels:
+            if label in tasic_centroids.index and label in mouse_centroids[mouse].index:
+                tasic_row = tasic_centroids.loc[label].values
+                mouse_row = mouse_centroids[mouse].loc[label].values
+                # Compute Pearson correlation
+                corr = np.corrcoef(tasic_row, mouse_row)[0, 1]
+                correlations.append(corr if not np.isnan(corr) else 0.0)
+            else:
+                correlations.append(0.0)
+        
+        # Create 4-panel figure: Tasic | Mouse | Difference | Correlations
+        fig = plt.figure(figsize=(16, max(5, len(all_labels) * 0.3)))
+        gs = fig.add_gridspec(1, 4, width_ratios=[1, 1, 1, 0.6], wspace=0.3)
+        
+        # Panel 1: Tasic reference
+        ax1 = fig.add_subplot(gs[0, 0])
+        im1 = ax1.imshow(tasic_data, aspect="auto", cmap="RdBu_r", vmin=-2.5, vmax=2.5)
+        ax1.set_yticks(range(len(all_labels)))
+        ax1.set_yticklabels(all_labels, fontsize=7)
+        ax1.set_xticks(range(tasic_data.shape[1]))
+        ax1.set_xticklabels([f"G{i+1}" for i in range(tasic_data.shape[1])], fontsize=7, rotation=90)
+        ax1.set_title("Tasic reference", fontsize=11, fontweight="bold")
+        plt.colorbar(im1, ax=ax1, label="z-score")
+        
+        # Panel 2: Mouse data
+        ax2 = fig.add_subplot(gs[0, 1])
+        im2 = ax2.imshow(mouse_data, aspect="auto", cmap="RdBu_r", vmin=-2.5, vmax=2.5)
+        ax2.set_yticks(range(len(all_labels)))
+        ax2.set_yticklabels([], fontsize=7)
+        ax2.set_xticks(range(mouse_data.shape[1]))
+        ax2.set_xticklabels([f"G{i+1}" for i in range(mouse_data.shape[1])], fontsize=7, rotation=90)
+        n_cells = (hcr_assignments_c["mouse_id"] == mouse).sum()
+        ax2.set_title(f"Mouse {mouse} (n={n_cells})", fontsize=11, fontweight="bold")
+        plt.colorbar(im2, ax=ax2, label="z-score")
+        
+        # Panel 3: Difference (Mouse - Reference)
+        ax3 = fig.add_subplot(gs[0, 2])
+        # Use diverging colormap centered at 0 for differences
+        diff_max = np.abs(diff_data.values).max()
+        im3 = ax3.imshow(diff_data, aspect="auto", cmap="RdBu_r", vmin=-diff_max, vmax=diff_max)
+        ax3.set_yticks(range(len(all_labels)))
+        ax3.set_yticklabels([], fontsize=7)
+        ax3.set_xticks(range(diff_data.shape[1]))
+        ax3.set_xticklabels([f"G{i+1}" for i in range(diff_data.shape[1])], fontsize=7, rotation=90)
+        ax3.set_title("Difference\n(Mouse - Reference)", fontsize=11, fontweight="bold")
+        plt.colorbar(im3, ax=ax3, label="ΔZ-score")
+        
+        # Panel 4: Per-cluster correlations
+        ax4 = fig.add_subplot(gs[0, 3])
+        colors = ["green" if corr > 0.8 else "orange" if corr > 0.6 else "red" for corr in correlations]
+        ax4.barh(range(len(all_labels)), correlations, color=colors, edgecolor="black", linewidth=0.5)
+        ax4.set_yticks(range(len(all_labels)))
+        ax4.set_yticklabels([], fontsize=7)
+        ax4.set_xlabel("Pearson r", fontsize=9)
+        ax4.set_title("Cluster-wise\ncorrelation", fontsize=11, fontweight="bold")
+        ax4.set_xlim([-1, 1])
+        ax4.axvline(0.8, color="green", linestyle="--", alpha=0.5, linewidth=1)
+        ax4.axvline(0.6, color="orange", linestyle="--", alpha=0.5, linewidth=1)
+        ax4.tick_params(axis="x", labelsize=8)
+        ax4.grid(axis="x", alpha=0.3)
+        
+        # Add text annotations for correlation values
+        for i, (label, corr) in enumerate(zip(all_labels, correlations)):
+            ax4.text(corr + 0.05, i, f"{corr:.2f}", va="center", fontsize=6)
+        
+        plt.suptitle(f"Mouse {mouse}: Comprehensive mean expression analysis", fontsize=12, fontweight="bold", y=0.98)
+        plt.savefig(mouse_dir / "mean_expression_4panel_comparison.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        
+        # Save per-mouse centroids and differences as CSV
+        mouse_centroids[mouse].to_csv(mouse_dir / "mean_expression_centroids.csv")
+        diff_data.to_csv(mouse_dir / "mean_expression_diff.csv")
+        pd.DataFrame({
+            "cluster": all_labels,
+            "pearson_r": correlations,
+        }).to_csv(mouse_dir / "cluster_correlations.csv", index=False)
+        
+        print(f"    Mouse {mouse}: per-mouse summary saved to {mouse_dir}")
 
 
 # =============================================================================
@@ -2443,6 +3165,7 @@ def main(
     effect_threshold: float = 1.0,
     drop_minor_subclasses: bool = False,
     min_cells_per_cluster: int = 0,
+    min_cells_per_branch_cluster: int = 0,
 ) -> None:
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     setup_logging(OUT_ROOT)
@@ -2450,7 +3173,14 @@ def main(
     print(f"  Batch correction mode: {batch_mode}")
     print(f"  Effect size threshold: {effect_threshold}")
     print(f"  Drop minor subclasses: {drop_minor_subclasses}")
-    print(f"  Min cells per cluster: {min_cells_per_cluster}")
+    print(f"  Min cells per cluster (Stage 1): {min_cells_per_cluster}")
+    print(f"  Min cells per branch cluster (Stage 4): {min_cells_per_branch_cluster}")
+
+    # Create stage-specific subdirectories
+    normalization_dir = OUT_ROOT / "normalization"
+    batch_correction_dir = OUT_ROOT / "batch-correction"
+    normalization_dir.mkdir(parents=True, exist_ok=True)
+    batch_correction_dir.mkdir(parents=True, exist_ok=True)
 
     # Stage 1
     tasic_z, hcr_z, tasic_log, hcr_log = run_stage1(
@@ -2459,10 +3189,10 @@ def main(
     )
 
     # Stage 1 summary plots
-    plot_normalization_summary(tasic_z, hcr_z, OUT_ROOT)
+    plot_normalization_summary(tasic_z, hcr_z, normalization_dir)
 
     # Stage 2
-    hcr_corrected = run_stage2(hcr_z, hcr_log, tasic_z, OUT_ROOT, batch_mode=batch_mode)
+    hcr_corrected = run_stage2(hcr_z, hcr_log, tasic_z, batch_correction_dir, batch_mode=batch_mode)
 
     # Save processed data for downstream stages
     print("\n  Saving processed AnnData objects...")
@@ -2505,7 +3235,8 @@ def main(
 
     # Stage 4
     branch_results, tasic_gating, hcr_gating, branch_marker_names = run_stage4(
-        tasic_z, hcr_corrected, OUT_ROOT
+        tasic_z, hcr_corrected, OUT_ROOT,
+        min_cells_per_branch_cluster=min_cells_per_branch_cluster,
     )
 
     # Stage 5
@@ -2542,8 +3273,15 @@ if __name__ == "__main__":
         help="Drop Serpinf1, CR, and Meis2 subclass cells from Tasic reference.",
     )
     parser.add_argument(
-        "--min-cells-per-cluster", type=int, default=0,
-        help="Drop Tasic clusters with fewer than N cells (default: 0 = keep all).",
+        "--min-cells-per-cluster", type=int, default=10,
+        help="(Stage 1) Drop Tasic clusters with fewer than N cells before any "
+             "analysis (default: 10, 0 = keep all).",
+    )
+    parser.add_argument(
+        "--min-cells-per-branch-cluster", type=int, default=10,
+        help="(Stage 4) After within-branch Leiden clustering, drop branch "
+             "clusters with fewer than N Tasic cells. Prevents rare/noisy "
+             "clusters from entering the matching reference (default: 10).",
     )
     args = parser.parse_args()
     main(
@@ -2551,4 +3289,5 @@ if __name__ == "__main__":
         effect_threshold=args.effect_threshold,
         drop_minor_subclasses=args.drop_minor_subclasses,
         min_cells_per_cluster=args.min_cells_per_cluster,
+        min_cells_per_branch_cluster=args.min_cells_per_branch_cluster,
     )
