@@ -29,6 +29,7 @@ import pandas as pd
 from sklearn.cluster import KMeans
 
 import aind_hcr_qc.viz as viz
+from aind_hcr_data_loader import get_hcr_dataset_pairwise
 
 import atlas_compare
 import cluster_validation_utils
@@ -41,6 +42,7 @@ import cluster_validation_utils
 ABC_ATLAS_DIR = Path("/root/capsule/data/abc_atlas")
 V1_CELLS_CSV = Path("/root/capsule/code/v1_merfish_cells.csv")
 SS_PATH = Path("/root/capsule/scratch/mouse_VISp_gene_expression_matrices_2018-06-14")
+DATA_DIR = Path("/root/capsule/data")
 DEFAULT_OUT_DIR = Path("/root/capsule/scratch/reference_atlas_cellxgene")
 
 DROP_LAYERS = ["VISp6a", "VISp6b"]
@@ -447,6 +449,97 @@ def run_10x_hmb_stub(out_root: Path) -> None:
 
 
 # -----------------------------------------------------------------------------
+# HCR
+# -----------------------------------------------------------------------------
+
+
+def run_hcr(
+    out_root: Path,
+    mouse_id: str,
+    k: int,
+    dpi: int,
+    clip_max: float,
+    max_plot_cells: int,
+    max_plot_genes: int,
+    random_seed: int,
+) -> None:
+    print("\n" + "=" * 72)
+    print(f"HCR: collecting inhibitory cell×gene for mouse {mouse_id}")
+    print("=" * 72)
+
+    out_dir = out_root / "hcr" / str(mouse_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("[HCR 1/3] Loading pairwise HCR dataset...")
+    _, pw_ds, _ = get_hcr_dataset_pairwise(
+        mouse_id=mouse_id,
+        data_dir=DATA_DIR,
+        load_spots=False,
+        return_removed=False,
+        coreg_cells_only=False,
+    )
+
+    print("[HCR 2/3] Loading inhibitory cell×gene matrix...")
+    adata = pw_ds.load_inhibitory_cells(unmixed=True, all_spots=False, as_anndata=True)
+    print(f"  Raw inhibitory matrix: {adata.n_obs:,} cells x {adata.n_vars:,} genes")
+
+    X = adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray()
+    cxg = pd.DataFrame(
+        np.asarray(X),
+        index=adata.obs_names.astype(str),
+        columns=adata.var_names.astype(str),
+    ).fillna(0)
+
+    cxg = _subset_to_hcr_panel(cxg, HCR_PANEL_GENES)
+    print(f"  Panel-subset matrix: {cxg.shape[0]:,} cells x {cxg.shape[1]:,} genes")
+
+    print("[HCR 3/3] Writing outputs and clustered PNG...")
+    cxg.to_csv(out_dir / "cell_x_gene.csv")
+
+    obs_cols = [c for c in ["subclass", "cluster", "section", "x", "y"] if c in adata.obs.columns]
+    if obs_cols:
+        adata.obs.loc[:, obs_cols].to_csv(out_dir / "cell_metadata.csv")
+
+    _plot_clustered_cellxgene(
+        cxg=cxg,
+        out_png=out_dir / "cell_x_gene_clustered_kmeans.png",
+        title=f"HCR mouse {mouse_id} inhibitory (k-means clustered)",
+        k=k,
+        dpi=dpi,
+        clip_max=clip_max,
+        max_plot_cells=max_plot_cells,
+        max_plot_genes=max_plot_genes,
+        random_seed=random_seed,
+    )
+
+    _write_run_metadata(
+        out_dir,
+        {
+            "dataset": "HCR",
+            "mouse_id": str(mouse_id),
+            "data_dir": str(DATA_DIR),
+            "source": "get_hcr_dataset_pairwise + load_inhibitory_cells(unmixed=True, all_spots=False)",
+            "hcr_panel_genes": HCR_PANEL_GENES,
+            "matrix_shape": [int(cxg.shape[0]), int(cxg.shape[1])],
+            "plot": {
+                "cluster_method": "kmeans",
+                "k": k,
+                "clip_range": [0, clip_max],
+                "subclass_order": SUBCLASS_ORDER,
+                "max_plot_cells": max_plot_cells,
+                "max_plot_genes": max_plot_genes,
+                "random_seed": random_seed,
+                "dpi": dpi,
+            },
+        },
+    )
+
+    del adata, cxg, X
+    gc.collect()
+    print(f"  Saved HCR outputs -> {out_dir}")
+
+
+# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
@@ -459,9 +552,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--datasets",
         nargs="+",
-        default=["merfish", "tasic"],
-        choices=["merfish", "tasic", "10x-hmb"],
+        default=["merfish", "tasic", "hcr"],
+        choices=["merfish", "tasic", "hcr", "10x-hmb"],
         help="Reference datasets to run.",
+    )
+    parser.add_argument(
+        "--hcr-mouse-id",
+        default="790322",
+        help="Mouse ID for HCR dataset collection.",
     )
     parser.add_argument(
         "--output-dir",
@@ -496,7 +594,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--clip-max",
         type=float,
-        default=50.0,
+        default=200.0,
         help="Upper bound of display clip range (lower bound is always 0).",
     )
     parser.add_argument(
@@ -555,6 +653,18 @@ def main() -> None:
         run_tasic(
             out_root=out_root,
             tasic_layer=args.tasic_layer,
+            k=args.k,
+            dpi=args.dpi,
+            clip_max=args.clip_max,
+            max_plot_cells=args.max_plot_cells,
+            max_plot_genes=args.max_plot_genes,
+            random_seed=args.random_seed,
+        )
+
+    if "hcr" in args.datasets:
+        run_hcr(
+            out_root=out_root,
+            mouse_id=args.hcr_mouse_id,
             k=args.k,
             dpi=args.dpi,
             clip_max=args.clip_max,
