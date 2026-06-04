@@ -1257,6 +1257,7 @@ def soft_subclass_gating(
 
 
 def within_branch_leiden_clustering(
+    tasic_log: ad.AnnData,
     tasic_z: ad.AnnData,
     branch: str,
     branch_assignments: pd.DataFrame,
@@ -1271,8 +1272,10 @@ def within_branch_leiden_clustering(
 
     Parameters
     ----------
+    tasic_log : AnnData
+        Full Tasic log-normalized data (used for clustering).
     tasic_z : AnnData
-        Full Tasic z-scored data.
+        Full Tasic z-scored data (used for downstream matching outputs).
     branch : str
         Branch name (e.g. "Pvalb").
     branch_assignments : DataFrame
@@ -1286,7 +1289,7 @@ def within_branch_leiden_clustering(
     Returns
     -------
     adata_branch : AnnData
-        Branch subset with 'leiden' column in .obs.
+        Z-scored branch subset with clustering labels in .obs.
     results_dict : dict
         Sweep results, best params, ARI.
     """
@@ -1296,43 +1299,44 @@ def within_branch_leiden_clustering(
     branch_cells = branch_assignments[
         branch_assignments["assigned_branch"] == branch
     ]["cell_id"].values
-    mask = tasic_z.obs_names.isin(branch_cells)
-    adata_branch = tasic_z[mask].copy()
+    branch_obs_names = tasic_log.obs_names[tasic_log.obs_names.isin(branch_cells)]
+    adata_branch_cluster = tasic_log[branch_obs_names].copy()
+    adata_branch_match = tasic_z[branch_obs_names].copy()
 
-    if adata_branch.n_obs < 10:
-        print(f"    WARNING: Branch {branch} has only {adata_branch.n_obs} cells, skipping.")
-        return adata_branch, {"skip": True, "n_cells": adata_branch.n_obs}
+    if adata_branch_cluster.n_obs < 10:
+        print(f"    WARNING: Branch {branch} has only {adata_branch_cluster.n_obs} cells, skipping.")
+        return adata_branch_match, {"skip": True, "n_cells": adata_branch_cluster.n_obs}
 
-    print(f"    Branch {branch}: {adata_branch.n_obs} cells, "
-          f"{adata_branch.obs['cluster'].nunique()} original Tasic clusters")
+        print(f"    Branch {branch}: {adata_branch_cluster.n_obs} cells, "
+            f"{adata_branch_cluster.obs['cluster'].nunique()} original Tasic clusters")
 
     if n_neighbors_range is None:
         n_neighbors_range = [5, 10, 15, 20, 30, 40, 50]
     if resolution_range is None:
-        resolution_range = [0.3, 0.5, 0.8, 1.0, 1.5, 2.0]
+        resolution_range = [0.1, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0]
 
     # Parameter sweep: test all param combinations and compute both ARI and silhouette
     sweep_rows = []
     for n_neighbors in n_neighbors_range:
-        if n_neighbors >= adata_branch.n_obs:
+        if n_neighbors >= adata_branch_cluster.n_obs:
             continue
         for resolution in resolution_range:
-            sc.pp.neighbors(adata_branch, use_rep="X", n_neighbors=n_neighbors)
+            sc.pp.neighbors(adata_branch_cluster, use_rep="X", n_neighbors=n_neighbors)
             sc.tl.leiden(
-                adata_branch, resolution=resolution,
+                adata_branch_cluster, resolution=resolution,
                 key_added="leiden_test", flavor="igraph",
             )
             ari = adjusted_rand_score(
-                adata_branch.obs["cluster"].astype(str),
-                adata_branch.obs["leiden_test"].astype(str),
+                adata_branch_cluster.obs["cluster"].astype(str),
+                adata_branch_cluster.obs["leiden_test"].astype(str),
             )
             
             # Compute silhouette score (cluster tightness in gene expression space)
-            n_clusters_test = adata_branch.obs["leiden_test"].nunique()
-            if n_clusters_test > 1 and n_clusters_test < adata_branch.n_obs:
+            n_clusters_test = adata_branch_cluster.obs["leiden_test"].nunique()
+            if n_clusters_test > 1 and n_clusters_test < adata_branch_cluster.n_obs:
                 silhouette = silhouette_score(
-                    adata_branch.X,
-                    adata_branch.obs["leiden_test"].astype(str).values
+                    adata_branch_cluster.X,
+                    adata_branch_cluster.obs["leiden_test"].astype(str).values
                 )
             else:
                 silhouette = np.nan
@@ -1345,40 +1349,75 @@ def within_branch_leiden_clustering(
                 "n_clusters": n_clusters_test,
             })
 
-    sweep_df = pd.DataFrame(sweep_rows).sort_values("ari", ascending=False).reset_index(drop=True)
-    best = sweep_df.iloc[0]
+    sweep_df = pd.DataFrame(sweep_rows).reset_index(drop=True)
+
+    # ── Silhouette-first parameter selection ─────────────────────────────────
+    # Strategy:
+    #   1. For each resolution, average silhouette across all n_neighbors tested.
+    #      → pick the resolution with the highest mean silhouette (panel-appropriate
+    #        cluster count, not chasing fine taxonomy splits).
+    #   2. At that resolution, pick the n_neighbors with the single best silhouette.
+    #   3. ARI is preserved in sweep_df for reference and diagnostics only.
+    valid = sweep_df[sweep_df["silhouette"].notna()]
+    if len(valid) == 0:
+        # Fall back to ARI if silhouette unavailable (e.g. <2 clusters)
+        print("      WARNING: silhouette unavailable for all combos, falling back to ARI")
+        best = sweep_df.sort_values("ari", ascending=False).iloc[0]
+    else:
+        mean_sil_by_res = valid.groupby("resolution")["silhouette"].mean()
+        best_r_sil = float(mean_sil_by_res.idxmax())
+        at_best_r = valid[valid["resolution"] == best_r_sil]
+        best = at_best_r.loc[at_best_r["silhouette"].idxmax()]
+
     best_n = int(best["n_neighbors"])
     best_r = float(best["resolution"])
 
     # Final clustering with best params
-    sc.pp.neighbors(adata_branch, use_rep="X", n_neighbors=best_n)
-    sc.tl.leiden(adata_branch, resolution=best_r, flavor="igraph")
-    sc.tl.umap(adata_branch)
+    sc.pp.neighbors(adata_branch_cluster, use_rep="X", n_neighbors=best_n)
+    sc.tl.leiden(adata_branch_cluster, resolution=best_r, flavor="igraph")
+    sc.tl.umap(adata_branch_cluster)
 
     # Label Leiden clusters with branch prefix
-    adata_branch.obs["branch_cluster"] = [
-        f"{branch}-{lid}" for lid in adata_branch.obs["leiden"].values
+    adata_branch_cluster.obs["branch_cluster"] = [
+        f"{branch}-{lid}" for lid in adata_branch_cluster.obs["leiden"].values
     ]
+
+    # Transfer clustering labels from log-space clustering object to z-space
+    # matching object so downstream centroid correlation remains in z-space.
+    leiden_map = adata_branch_cluster.obs["leiden"].astype(str)
+    branch_cluster_map = adata_branch_cluster.obs["branch_cluster"].astype(str)
+    adata_branch_match.obs["leiden"] = leiden_map.reindex(adata_branch_match.obs_names).values
+    adata_branch_match.obs["branch_cluster"] = (
+        branch_cluster_map.reindex(adata_branch_match.obs_names).values
+    )
+    adata_branch_match.obsm["X_umap"] = adata_branch_cluster.obsm["X_umap"]
+    adata_branch_match.obsm["X_cluster"] = adata_branch_cluster.X
 
     # Drop underpopulated branch clusters if threshold is set
     if min_cells_per_branch_cluster > 0:
-        cluster_counts = adata_branch.obs["branch_cluster"].value_counts()
+        cluster_counts = adata_branch_cluster.obs["branch_cluster"].value_counts()
         keep_clusters = cluster_counts[cluster_counts >= min_cells_per_branch_cluster].index
-        n_before = adata_branch.n_obs
+        n_before = adata_branch_cluster.n_obs
         n_clusters_before = cluster_counts.shape[0]
-        adata_branch = adata_branch[
-            adata_branch.obs["branch_cluster"].isin(keep_clusters)
+        adata_branch_cluster = adata_branch_cluster[
+            adata_branch_cluster.obs["branch_cluster"].isin(keep_clusters)
         ].copy()
+        adata_branch_match = adata_branch_match[
+            adata_branch_match.obs_names.isin(adata_branch_cluster.obs_names)
+        ].copy()
+        adata_branch_match.obsm["X_umap"] = adata_branch_cluster.obsm["X_umap"]
+        adata_branch_match.obsm["X_cluster"] = adata_branch_cluster.X
         n_dropped_clusters = n_clusters_before - len(keep_clusters)
-        n_dropped_cells = n_before - adata_branch.n_obs
+        n_dropped_cells = n_before - adata_branch_cluster.n_obs
         if n_dropped_clusters > 0:
             print(f"      Dropped {n_dropped_clusters} branch cluster(s) with "
                   f"< {min_cells_per_branch_cluster} cells "
                   f"({n_dropped_cells} cells removed)")
 
-    n_clusters = adata_branch.obs["leiden"].nunique()
+    n_clusters = adata_branch_cluster.obs["leiden"].nunique()
+    best_sil = best["silhouette"] if pd.notna(best["silhouette"]) else float("nan")
     print(f"      Best params: n_neighbors={best_n}, resolution={best_r:.1f}, "
-          f"ARI={best['ari']:.3f}, n_clusters={n_clusters}")
+          f"silhouette={best_sil:.3f}, ARI={best['ari']:.3f}, n_clusters={n_clusters}")
 
     results_dict = {
         "sweep_df": sweep_df,
@@ -1386,11 +1425,12 @@ def within_branch_leiden_clustering(
             "best_n_neighbors": best_n,
             "best_resolution": best_r,
             "best_ari": float(best["ari"]),
+            "best_silhouette": float(best_sil),
         },
-        "n_cells": adata_branch.n_obs,
+        "n_cells": adata_branch_cluster.n_obs,
         "n_clusters": n_clusters,
     }
-    return adata_branch, results_dict
+    return adata_branch_match, results_dict
 
 
 def bootstrap_branch_stability(
@@ -1562,43 +1602,112 @@ def plot_stage4_diagnostics(
     print(f"  Saved: stage4_01-03 diagnostic plots")
 
 
-def plot_silhouette_vs_ari_sweep(
+def plot_sweep_diagnostics(
     sweep_df: pd.DataFrame,
     branch: str,
     out_dir: Path,
+    best_n_neighbors: int | None = None,
+    best_resolution: float | None = None,
 ) -> None:
     """
-    Plot silhouette score and ARI side-by-side across parameter sweep.
-    
-    Helps visualize whether high ARI correlates with cluster tightness
-    or if there's a trade-off that shouldn't be ignored.
+    Three-panel sweep diagnostic:
+      Left  — Silhouette heatmap (resolution × n_neighbors), selection marked
+      Centre — ARI heatmap (reference only)
+      Right  — Elbow plot: mean silhouette vs. n_clusters (aggregated over all
+                n_neighbors at each resolution), with within-cluster SS on a
+                secondary axis as the classic elbow curve.
     """
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    
-    # Left: ARI sorted heatmap
-    sweep_pivot_ari = sweep_df.pivot(index="resolution", columns="n_neighbors", values="ari")
-    sns.heatmap(sweep_pivot_ari, annot=True, fmt=".3f", cmap="RdYlGn", 
-                ax=axes[0], cbar_kws={"label": "ARI"}, vmin=0, vmax=1)
-    axes[0].set_title(f"{branch}: ARI (Leiden vs. original Tasic labels)")
+    has_sil = "silhouette" in sweep_df.columns and sweep_df["silhouette"].notna().any()
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # ── Panel 1: Silhouette heatmap ──────────────────────────────────────────
+    if has_sil:
+        sil_pivot = sweep_df.pivot_table(
+            index="resolution", columns="n_neighbors", values="silhouette"
+        )
+        sns.heatmap(sil_pivot, annot=True, fmt=".3f", cmap="coolwarm",
+                    ax=axes[0], cbar_kws={"label": "Silhouette"}, center=0)
+        # Mark selected params
+        if best_resolution is not None and best_n_neighbors is not None:
+            rows = list(sil_pivot.index)
+            cols = list(sil_pivot.columns)
+            if best_resolution in rows and best_n_neighbors in cols:
+                r_idx = rows.index(best_resolution)
+                c_idx = cols.index(best_n_neighbors)
+                axes[0].add_patch(
+                    plt.Rectangle((c_idx, r_idx), 1, 1,
+                                   fill=False, edgecolor="gold", lw=3)
+                )
+        axes[0].set_title(f"{branch}: Silhouette (★ = selected)")
+    else:
+        axes[0].text(0.5, 0.5, "Silhouette unavailable",
+                     ha="center", va="center", transform=axes[0].transAxes)
+        axes[0].set_title(f"{branch}: Silhouette")
     axes[0].set_xlabel("n_neighbors")
     axes[0].set_ylabel("resolution")
-    
-    # Right: Silhouette heatmap (only if available)
-    if "silhouette" in sweep_df.columns and sweep_df["silhouette"].notna().any():
-        sweep_pivot_sil = sweep_df.pivot(index="resolution", columns="n_neighbors", values="silhouette")
-        sns.heatmap(sweep_pivot_sil, annot=True, fmt=".3f", cmap="coolwarm", 
-                    ax=axes[1], cbar_kws={"label": "Silhouette"}, center=0)
-        axes[1].set_title(f"{branch}: Silhouette (cluster tightness)")
-    else:
-        axes[1].text(0.5, 0.5, "Silhouette data unavailable", 
-                     ha="center", va="center", transform=axes[1].transAxes)
-        axes[1].set_title(f"{branch}: Silhouette (cluster tightness)")
-    
+
+    # ── Panel 2: ARI heatmap (reference) ────────────────────────────────────
+    ari_pivot = sweep_df.pivot_table(
+        index="resolution", columns="n_neighbors", values="ari"
+    )
+    sns.heatmap(ari_pivot, annot=True, fmt=".3f", cmap="RdYlGn",
+                ax=axes[1], cbar_kws={"label": "ARI"}, vmin=0, vmax=1)
+    axes[1].set_title(f"{branch}: ARI vs. Tasic labels (reference only)")
     axes[1].set_xlabel("n_neighbors")
     axes[1].set_ylabel("resolution")
-    
+
+    # ── Panel 3: Elbow plot ──────────────────────────────────────────────────
+    # Aggregate by n_clusters: mean silhouette and mean within-SS as elbow signal
+    ax3 = axes[2]
+    elbow_df = (
+        sweep_df
+        .groupby("n_clusters", as_index=False)
+        .agg(mean_silhouette=("silhouette", "mean"), mean_ari=("ari", "mean"))
+        .sort_values("n_clusters")
+    )
+
+    color_sil = "#1f77b4"
+    color_ari = "#d62728"
+
+    ax3.plot(elbow_df["n_clusters"], elbow_df["mean_silhouette"],
+             "o-", color=color_sil, linewidth=2, markersize=5, label="Mean silhouette")
+    ax3.set_xlabel("Number of clusters")
+    ax3.set_ylabel("Mean silhouette score", color=color_sil)
+    ax3.tick_params(axis="y", labelcolor=color_sil)
+    ax3.axhline(0, color=color_sil, linestyle=":", alpha=0.4)
+
+    ax3b = ax3.twinx()
+    ax3b.plot(elbow_df["n_clusters"], elbow_df["mean_ari"],
+              "s--", color=color_ari, linewidth=1.5, markersize=4,
+              alpha=0.7, label="Mean ARI")
+    ax3b.set_ylabel("Mean ARI", color=color_ari)
+    ax3b.tick_params(axis="y", labelcolor=color_ari)
+
+    # Mark selected n_clusters if known
+    if best_resolution is not None and best_n_neighbors is not None:
+        sel = sweep_df[
+            (sweep_df["resolution"] == best_resolution) &
+            (sweep_df["n_neighbors"] == best_n_neighbors)
+        ]
+        if len(sel) > 0:
+            sel_k = int(sel.iloc[0]["n_clusters"])
+            ax3.axvline(sel_k, color="gold", linestyle="--", linewidth=2,
+                        label=f"Selected k={sel_k}")
+
+    lines1, labels1 = ax3.get_legend_handles_labels()
+    lines2, labels2 = ax3b.get_legend_handles_labels()
+    ax3.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right")
+    ax3.set_title(f"{branch}: Elbow plot (silhouette vs. n_clusters)")
+    ax3.set_xticks(sorted(elbow_df["n_clusters"].unique()))
+    ax3.tick_params(axis="x", rotation=45)
+
+    plt.suptitle(
+        f"{branch}: Parameter sweep diagnostics (selection = max mean silhouette per resolution)",
+        fontsize=11, y=1.02,
+    )
     plt.tight_layout()
-    out_path = out_dir / f"stage4_sweep_ari_silhouette_{branch.lower()}.png"
+    out_path = out_dir / f"sweep_diagnostics_{branch.lower()}.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"    Saved: {out_path.name}")
@@ -1667,18 +1776,25 @@ def print_sweep_summary(
         print(f"      n_neighbors={int(row['n_neighbors']):2d}, resolution={row['resolution']:.1f} → "
               f"ARI={row['ari']:.3f}, n_clusters={int(row['n_clusters']):2d}, {sil_str}")
     
-    # Top by silhouette (if available)
+    # Top by silhouette (if available) + mean silhouette per resolution (selection basis)
     if sweep_df["silhouette"].notna().any():
         top_sil = sweep_df.nlargest(top_n, "silhouette")[
             ["n_neighbors", "resolution", "ari", "n_clusters", "silhouette"]
         ]
-        print(f"\n    Top {top_n} by Silhouette (cluster tightness):")
+        print(f"\n    Top {top_n} by Silhouette (cluster tightness) — used for selection:")
         for i, row in top_sil.iterrows():
             print(f"      n_neighbors={int(row['n_neighbors']):2d}, resolution={row['resolution']:.1f} → "
                   f"silhouette={row['silhouette']:.3f}, ARI={row['ari']:.3f}, n_clusters={int(row['n_clusters']):2d}")
 
+        mean_sil = sweep_df.groupby("resolution")["silhouette"].mean().sort_values(ascending=False)
+        print(f"\n    Mean silhouette per resolution (selection rank):")
+        for res, sil in mean_sil.items():
+            marker = " ← selected" if res == mean_sil.index[0] else ""
+            print(f"      resolution={res:.1f}  mean_silhouette={sil:.3f}{marker}")
+
 
 def run_stage4(
+    tasic_log: ad.AnnData,
     tasic_z: ad.AnnData,
     hcr_corrected: ad.AnnData,
     out_dir: Path,
@@ -1699,8 +1815,10 @@ def run_stage4(
 
     Parameters
     ----------
+    tasic_log : AnnData
+        Log-normalized Tasic inhibitory cells (used for within-branch clustering).
     tasic_z : AnnData
-        Z-scored Tasic inhibitory cells.
+        Z-scored Tasic inhibitory cells (used for matching features and gating).
     hcr_corrected : AnnData
         Batch-corrected z-scored HCR cells.
     out_dir : Path
@@ -1800,7 +1918,7 @@ def run_stage4(
     for branch in CANONICAL_BRANCHES:
         print(f"\n  --- Branch: {branch} ---")
         adata_branch, res_dict = within_branch_leiden_clustering(
-            tasic_z, branch, tasic_gating,
+            tasic_log, tasic_z, branch, tasic_gating,
             min_cells_per_branch_cluster=min_cells_per_branch_cluster,
         )
 
@@ -1810,10 +1928,15 @@ def run_stage4(
 
         branch_results[branch] = (adata_branch, res_dict)
 
-        # 4.2b Print sweep summary and plot silhouette vs ARI
+        # 4.2b Print sweep summary and plot sweep diagnostics (silhouette elbow + heatmaps)
         sweep_df = res_dict["sweep_df"]
+        best_p = res_dict["best_params"]
         print_sweep_summary(sweep_df, branch, top_n=3)
-        plot_silhouette_vs_ari_sweep(sweep_df, branch, stage4_dir)
+        plot_sweep_diagnostics(
+            sweep_df, branch, stage4_dir,
+            best_n_neighbors=best_p["best_n_neighbors"],
+            best_resolution=best_p["best_resolution"],
+        )
 
         # 4.3 Bootstrap stability
         print(f"    Running bootstrap stability ({n_bootstraps} iterations)...")
@@ -3235,7 +3358,7 @@ def main(
 
     # Stage 4
     branch_results, tasic_gating, hcr_gating, branch_marker_names = run_stage4(
-        tasic_z, hcr_corrected, OUT_ROOT,
+        tasic_log, tasic_z, hcr_corrected, OUT_ROOT,
         min_cells_per_branch_cluster=min_cells_per_branch_cluster,
     )
 
