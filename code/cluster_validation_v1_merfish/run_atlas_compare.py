@@ -239,7 +239,7 @@ def _load_v1_merfish_cells() -> pd.DataFrame:
     return v1_cells
 
 
-def _ref_cache_subdir(label_level: str, hcr_genes) -> Path:
+def _ref_cache_subdir(label_level: str, hcr_genes, merfish_expression_scale: str) -> Path:
     """Return the cache subdirectory for a given set of reference parameters.
 
     The subdirectory name encodes label_level, ref_classes, min_label_cells,
@@ -250,6 +250,7 @@ def _ref_cache_subdir(label_level: str, hcr_genes) -> Path:
         {"label_level": label_level,
          "ref_classes": sorted(REF_CLASSES),
          "min_label_cells": MIN_LABEL_CELLS,
+         "merfish_expression_scale": merfish_expression_scale,
          "genes": sorted(str(g) for g in hcr_genes)},
         sort_keys=True,
     )
@@ -257,7 +258,12 @@ def _ref_cache_subdir(label_level: str, hcr_genes) -> Path:
     return REF_CACHE_DIR / f"{label_level}_{short_hash}"
 
 
-def _load_abc_reference(hcr_genes, v1_merfish_cells, label_level: str):
+def _load_abc_reference(
+    hcr_genes,
+    v1_merfish_cells,
+    label_level: str,
+    merfish_expression_scale: str,
+):
     """Load the MERFISH reference, using a per-gene-set on-disk cache.
 
     Cache is keyed by label_level + REF_CLASSES + MIN_LABEL_CELLS + sorted
@@ -265,7 +271,7 @@ def _load_abc_reference(hcr_genes, v1_merfish_cells, label_level: str):
     """
     import json
 
-    cache_dir   = _ref_cache_subdir(label_level, hcr_genes)
+    cache_dir   = _ref_cache_subdir(label_level, hcr_genes, merfish_expression_scale)
     counts_path = cache_dir / f"ref_counts_{label_level}.csv"
     labels_path = cache_dir / f"ref_labels_{label_level}.csv"
     meta_path   = cache_dir / "params.json"
@@ -298,6 +304,7 @@ def _load_abc_reference(hcr_genes, v1_merfish_cells, label_level: str):
         ref_classes     = REF_CLASSES,
         label_level     = label_level,
         min_label_cells = MIN_LABEL_CELLS,
+        expression_scale= merfish_expression_scale,
         save_dir        = cache_dir,   # save_dir writes the CSVs for us
         abc_cache       = abc_cache,
         ref_cell_meta   = ref_cell_meta,
@@ -308,6 +315,7 @@ def _load_abc_reference(hcr_genes, v1_merfish_cells, label_level: str):
         {"label_level": label_level,
          "ref_classes": REF_CLASSES,
          "min_label_cells": MIN_LABEL_CELLS,
+         "merfish_expression_scale": merfish_expression_scale,
          "genes": sorted(str(g) for g in hcr_genes)},
         indent=2,
     ))
@@ -425,7 +433,14 @@ def _run_one(
         print(f"Cell × gene (valid) figure written to: {output_dir}")
 
 
-def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int, legacy: bool = False) -> None:
+def run(
+    mouse_id: str,
+    output_dir: Path,
+    label_level: str,
+    dpi: int,
+    legacy: bool = False,
+    merfish_expression_scale: str = "log2",
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # When legacy mode is active, tag CSV rows with "<mouse_id>-legacy" so that
@@ -437,6 +452,7 @@ def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int, legacy: boo
     print(f"CSV mouse_id tag: {csv_mouse_id}")
     print(f"Output root: {output_dir}")
     print(f"Reference label level: {label_level}")
+    print(f"MERFISH expression scale: {merfish_expression_scale}")
     print(f"{'='*60}\n")
 
     # ── 1. Load dataset ───────────────────────────────────────────────────────
@@ -484,6 +500,7 @@ def run(mouse_id: str, output_dir: Path, label_level: str, dpi: int, legacy: boo
         hcr_genes        = hcr_genes,
         v1_merfish_cells = v1_merfish_cells,
         label_level      = label_level,
+        merfish_expression_scale = merfish_expression_scale,
     )
 
     # ── 5. Run comparison twice ───────────────────────────────────────────────
@@ -554,6 +571,12 @@ def _parse_args():
         help="Reference label granularity used for cluster matching.",
     )
     parser.add_argument(
+        "--merfish-expression-scale",
+        default="log2",
+        choices=["log2", "raw"],
+        help="MERFISH expression matrix to load from ABC Atlas.",
+    )
+    parser.add_argument(
         "--dpi", type=int, default=150,
         help="Figure resolution in dots per inch.",
     )
@@ -582,4 +605,5 @@ if __name__ == "__main__":
         label_level = args.label_level,
         dpi         = args.dpi,
         legacy      = args.legacy,
+        merfish_expression_scale = args.merfish_expression_scale,
     )

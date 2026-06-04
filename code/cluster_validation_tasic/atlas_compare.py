@@ -2744,6 +2744,254 @@ def run_basic_validation(
 # -----------------------------------------------------------------------------
 
 
+def load_abc_wmb_10x_reference(
+    abc_cache_dir,
+    genes: Sequence[str],
+    region_of_interest: str = "VIS",
+    ref_classes: Optional[Sequence[str]] = None,
+    exclude_supertype_substrings: Optional[Sequence[str]] = None,
+    min_supertype_cells: Optional[int] = None,
+    label_level: str = "subclass",
+    min_label_cells: int = 5,
+    expression_scale: str = "log2",
+    save_dir=None,
+    abc_cache=None,
+    ref_cell_meta: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """Load and filter a WMB-10X reference expression matrix from ABC Atlas.
+
+    Parameters
+    ----------
+    abc_cache_dir:
+        Path to ABC Atlas local cache root.
+    genes:
+        Iterable of gene symbols to include.
+    region_of_interest:
+        Region acronym filter from ``region_of_interest_acronym`` (e.g. ``"VIS"``).
+    ref_classes:
+        Optional list of class labels to keep from the ``class`` column.
+    exclude_supertype_substrings:
+        Optional list of case-insensitive substrings. Any cell whose
+        ``supertype`` contains one of these substrings is dropped.
+    min_supertype_cells:
+        Optional minimum cell count threshold applied to ``supertype`` groups
+        before ``label_level`` filtering.
+    label_level:
+        One of ``"class"``, ``"subclass"``, ``"supertype"``, ``"cluster"``.
+    min_label_cells:
+        Drop labels with fewer than this number of cells.
+    expression_scale:
+        Expression matrix variant. One of ``"log2"`` or ``"raw"``.
+    save_dir:
+        Optional directory to save CSV outputs.
+
+    Returns
+    -------
+    ref_counts : pd.DataFrame
+        Cells x genes matrix (selected expression scale).
+    ref_labels : pd.Series
+        Label vector indexed identically to ``ref_counts``.
+    """
+    if _AbcProjectCache is None:
+        raise ImportError(
+            "abc_atlas_access is not installed. "
+            "Install with:  pip install git+https://github.com/AllenInstitute/abc_atlas_access.git"
+        )
+    if _anndata is None:
+        raise ImportError("anndata is not installed. Install with:  pip install anndata")
+
+    if expression_scale not in {"log2", "raw"}:
+        raise ValueError(
+            f"expression_scale={expression_scale!r} not supported. "
+            "Use 'log2' or 'raw'."
+        )
+
+    import warnings
+    from pathlib import Path as _Path
+
+    abc_cache_dir = _Path(abc_cache_dir)
+
+    if abc_cache is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            abc_cache = _AbcProjectCache.from_cache_dir(abc_cache_dir)
+
+    if ref_cell_meta is None:
+        ref_cell_meta = abc_cache.get_metadata_dataframe(
+            directory="WMB-10X",
+            file_name="cell_metadata_with_cluster_annotation",
+            dtype={"cell_label": str},
+        )
+        ref_cell_meta.set_index("cell_label", inplace=True)
+
+    if "region_of_interest_acronym" not in ref_cell_meta.columns:
+        raise ValueError("WMB-10X metadata missing 'region_of_interest_acronym' column.")
+
+    region_cells = ref_cell_meta[ref_cell_meta["region_of_interest_acronym"] == region_of_interest].copy()
+    if len(region_cells) == 0:
+        raise ValueError(f"No cells found for region_of_interest={region_of_interest!r}")
+
+    if "feature_matrix_label" not in region_cells.columns or "dataset_label" not in region_cells.columns:
+        raise ValueError(
+            "WMB-10X metadata is missing required columns 'feature_matrix_label' and/or 'dataset_label'."
+        )
+
+    print(
+        f"[load_abc_wmb_10x_reference] region={region_of_interest!r} "
+        f"cells={len(region_cells):,} expression_scale={expression_scale!r}"
+    )
+
+    genes = [g for g in genes if isinstance(g, str)]
+    dataset_labels = region_cells["feature_matrix_label"].dropna().unique().tolist()
+    expr_parts = []
+    found_genes = set()
+
+    for feature_matrix_label in dataset_labels:
+        dataset_rows = region_cells[region_cells["feature_matrix_label"] == feature_matrix_label]
+        dataset_dir = str(dataset_rows["dataset_label"].iloc[0])
+        file_key = f"{feature_matrix_label}/{expression_scale}"
+        h5ad_path = abc_cache.get_file_path(directory=dataset_dir, file_name=file_key)
+
+        adata = _anndata.read_h5ad(h5ad_path, backed="r")
+        common_cells = dataset_rows.index.intersection(adata.obs_names)
+
+        if len(common_cells) == 0:
+            adata.file.close()
+            continue
+
+        obs_mask = adata.obs_names.isin(common_cells)
+        gene_meta = adata.var
+
+        if "gene_symbol" in gene_meta.columns:
+            gene_symbols = gene_meta["gene_symbol"].astype(str)
+        else:
+            gene_symbols = pd.Series(gene_meta.index.astype(str), index=gene_meta.index)
+
+        if genes:
+            gene_mask = gene_symbols.isin(genes)
+            selected_var_idx = gene_meta.index[gene_mask]
+            selected_gene_symbols = gene_symbols[gene_mask].tolist()
+            found_genes.update(selected_gene_symbols)
+
+            if len(selected_var_idx) == 0:
+                adata.file.close()
+                continue
+
+            part = adata[obs_mask, selected_var_idx].to_df()
+            part.columns = selected_gene_symbols
+        else:
+            part = adata[obs_mask, :].to_df()
+            part.columns = gene_symbols.tolist()
+
+        # Merge duplicate gene symbols if present.
+        part = part.groupby(part.columns, axis=1).sum()
+
+        adata.file.close()
+        expr_parts.append(part)
+
+    if len(expr_parts) == 0:
+        raise ValueError(
+            "No expression matrices yielded cells after region filtering. "
+            f"region_of_interest={region_of_interest!r}"
+        )
+
+    ref_counts = pd.concat(expr_parts, axis=0, join="outer").fillna(0)
+    ref_counts = ref_counts.loc[~ref_counts.index.duplicated(keep="first")]
+
+    if genes:
+        missing = sorted(set(genes) - set(found_genes))
+        if missing:
+            print(f"[load_abc_wmb_10x_reference] {len(missing)} genes not found (filled with 0): {missing}")
+        ref_counts = ref_counts.reindex(columns=list(genes), fill_value=0)
+
+    if ref_classes is not None:
+        if "class" not in ref_cell_meta.columns:
+            raise ValueError("ref_classes was provided, but metadata has no 'class' column.")
+        class_col = ref_cell_meta.loc[ref_counts.index, "class"]
+        class_mask = class_col.isin(ref_classes)
+        ref_counts = ref_counts.loc[class_mask]
+        print(
+            f"[load_abc_wmb_10x_reference] class filter -> {class_mask.sum():,} cells "
+            f"({class_col[class_mask].value_counts().to_dict()})"
+        )
+
+    if exclude_supertype_substrings:
+        if "supertype" not in ref_cell_meta.columns:
+            raise ValueError(
+                "exclude_supertype_substrings was provided, but metadata has no 'supertype' column."
+            )
+
+        supertype_col = ref_cell_meta.loc[ref_counts.index, "supertype"].astype(str)
+        exclude_mask = pd.Series(False, index=supertype_col.index)
+        for token in exclude_supertype_substrings:
+            if token is None:
+                continue
+            token = str(token).strip()
+            if not token:
+                continue
+            exclude_mask = exclude_mask | supertype_col.str.contains(token, case=False, na=False)
+
+        removed = int(exclude_mask.sum())
+        if removed > 0:
+            ref_counts = ref_counts.loc[~exclude_mask]
+        print(
+            f"[load_abc_wmb_10x_reference] supertype substring exclusion -> "
+            f"removed={removed:,} tokens={list(exclude_supertype_substrings)}"
+        )
+
+    if min_supertype_cells is not None:
+        if min_supertype_cells < 1:
+            raise ValueError("min_supertype_cells must be >= 1 when provided.")
+        if "supertype" not in ref_cell_meta.columns:
+            raise ValueError("min_supertype_cells was provided, but metadata has no 'supertype' column.")
+
+        supertype_col = ref_cell_meta.loc[ref_counts.index, "supertype"]
+        st_counts = supertype_col.value_counts()
+        keep_st = st_counts[st_counts >= int(min_supertype_cells)].index
+        st_mask = supertype_col.isin(keep_st)
+        dropped_st = int((~st_mask).sum())
+        ref_counts = ref_counts.loc[st_mask]
+        print(
+            f"[load_abc_wmb_10x_reference] min_supertype_cells={min_supertype_cells} -> "
+            f"kept={len(keep_st):,} supertypes dropped_cells={dropped_st:,}"
+        )
+
+    if label_level not in ref_cell_meta.columns:
+        available = [
+            c for c in ref_cell_meta.columns if c in ("class", "subclass", "supertype", "cluster")
+        ]
+        raise ValueError(
+            f"label_level={label_level!r} not found in cell metadata. Available: {available}"
+        )
+
+    ref_labels = ref_cell_meta.loc[ref_counts.index, label_level]
+
+    label_counts = ref_labels.value_counts()
+    keep = label_counts[label_counts >= min_label_cells].index
+    dropped = (label_counts < min_label_cells).sum()
+    keep_mask = ref_labels.isin(keep)
+    ref_counts = ref_counts.loc[keep_mask]
+    ref_labels = ref_labels.loc[keep_mask]
+
+    print(
+        f"[load_abc_wmb_10x_reference] label_level={label_level!r} "
+        f"kept={keep.size} labels dropped={dropped} (< {min_label_cells} cells)"
+    )
+    print(ref_labels.value_counts().to_string())
+
+    if save_dir is not None:
+        save_dir = _Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        counts_path = save_dir / f"ref_counts_{label_level}.csv"
+        labels_path = save_dir / f"ref_labels_{label_level}.csv"
+        ref_counts.to_csv(counts_path)
+        ref_labels.to_csv(labels_path, header=True)
+        print(f"[load_abc_wmb_10x_reference] saved -> {counts_path}")
+        print(f"[load_abc_wmb_10x_reference] saved -> {labels_path}")
+
+    return ref_counts, ref_labels
+
+
 def load_abc_merfish_reference(
     abc_cache_dir,
     genes: Sequence[str],
@@ -2751,6 +2999,7 @@ def load_abc_merfish_reference(
     ref_classes: Optional[Sequence[str]] = None,
     label_level: str = "subclass",
     min_label_cells: int = 5,
+    expression_scale: str = "log2",
     save_dir=None,
     abc_cache=None,
     ref_cell_meta: Optional[pd.DataFrame] = None,
@@ -2761,7 +3010,7 @@ def load_abc_merfish_reference(
 
     1. Initialise ``AbcProjectCache`` from *abc_cache_dir*.
     2. Load MERFISH cell metadata (cluster / subclass / class / supertype columns).
-    3. Open the log2 expression h5ad in backed mode and identify genes whose
+    3. Open the selected expression h5ad (log2 or raw) in backed mode and identify genes whose
        ``gene_symbol`` matches any entry in *genes*.
     4. Optionally restrict to a subset of cells given by *cell_index* (a
        pandas Index or any container understood by ``pd.Index.isin``).  Pass
@@ -2795,6 +3044,9 @@ def load_abc_merfish_reference(
     min_label_cells:
         Drop any label whose cell count (after all other filters) is below this
         threshold.  Prevents noisy centroids from sparse groups.  Default 5.
+    expression_scale:
+        Expression matrix variant to load from the ABC cache. One of
+        ``"log2"`` or ``"raw"``. Default ``"log2"``.
     save_dir:
         Optional path (str or Path-like) of a directory.  If provided the
         function writes two files there:
@@ -2803,8 +3055,8 @@ def load_abc_merfish_reference(
     Returns
     -------
     ref_counts : pd.DataFrame
-        Cells × genes expression matrix (log2, raw values from h5ad), filtered
-        and matched to *ref_labels*.
+        Cells × genes expression matrix (from selected ``expression_scale``),
+        filtered and matched to *ref_labels*.
     ref_labels : pd.Series
         Cell labels → reference group name, indexed identically to *ref_counts*.
     """
@@ -2815,6 +3067,12 @@ def load_abc_merfish_reference(
         )
     if _anndata is None:
         raise ImportError("anndata is not installed. Install with:  pip install anndata")
+
+    if expression_scale not in {"log2", "raw"}:
+        raise ValueError(
+            f"expression_scale={expression_scale!r} not supported. "
+            "Use 'log2' or 'raw'."
+        )
 
     import warnings
     from pathlib import Path as _Path
@@ -2840,8 +3098,9 @@ def load_abc_merfish_reference(
     # ── 3. Expression matrix (backed) ────────────────────────────────────────
     h5ad_path = abc_cache.get_file_path(
         directory="MERFISH-C57BL6J-638850",
-        file_name="C57BL6J-638850/log2",
+        file_name=f"C57BL6J-638850/{expression_scale}",
     )
+    print(f"[load_abc_merfish_reference] expression_scale={expression_scale!r}")
     adata = _anndata.read_h5ad(h5ad_path, backed="r")
     ref_gene_meta = adata.var  # Ensembl index, gene_symbol column
 

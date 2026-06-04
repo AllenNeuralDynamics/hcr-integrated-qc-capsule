@@ -10,7 +10,8 @@ and saves:
 - clustered cell×gene PNGs using simple k-means clustering from
   ``aind_hcr_qc.viz.plot_cell_x_gene_clustered``.
 
-10x-HMB is intentionally left as a stub for later implementation.
+10x-HMB is loaded from ABC WMB-10X with configurable region and
+expression scale (raw or log2).
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ DEFAULT_OUT_DIR = Path("/root/capsule/scratch/reference_atlas_cellxgene")
 
 DROP_LAYERS = ["VISp6a", "VISp6b"]
 INHIBITORY_REF_CLASSES = ["07 CTX-MGE GABA", "06 CTX-CGE GABA"]
+TENX_INHIBITORY_CLASSES = ["06 CTX-CGE GABA", "07 CTX-MGE GABA"]
 SUBCLASS_ORDER = ["Pvalb", "Sst", "Vip", "Lamp5"]
 
 # HCR panel genes used to subset reference atlas matrices (both MERFISH + TASIC).
@@ -203,7 +205,7 @@ def _plot_clustered_cellxgene(
 
     fig, _, _ = viz.plot_cell_x_gene_labeled(
         cxg_plot,
-        labels=labels.values,
+        labels=labels,
         clip_range=(0, clip_max),
         fig_size=fig_size,
         add_cluster_labels=True,
@@ -256,6 +258,7 @@ def run_merfish(
     out_root: Path,
     label_level: str,
     min_label_cells: int,
+    merfish_expression_scale: str,
     k: int,
     dpi: int,
     clip_max: float,
@@ -276,6 +279,7 @@ def run_merfish(
 
     print("[MERFISH 2/4] Using HCR_PANEL_GENES for atlas subsetting...")
     print(f"  HCR panel genes requested: {len(HCR_PANEL_GENES):,}")
+    print(f"  Expression scale: {merfish_expression_scale}")
 
     print("[MERFISH 3/4] Loading inhibitory reference counts from ABC Atlas...")
     ref_counts, ref_labels = atlas_compare.load_abc_merfish_reference(
@@ -285,6 +289,7 @@ def run_merfish(
         ref_classes=INHIBITORY_REF_CLASSES,
         label_level=label_level,
         min_label_cells=min_label_cells,
+        expression_scale=merfish_expression_scale,
         save_dir=None,
     )
 
@@ -325,6 +330,7 @@ def run_merfish(
             },
             "label_level": label_level,
             "min_label_cells": min_label_cells,
+            "expression_scale": merfish_expression_scale,
             "hcr_panel_genes": HCR_PANEL_GENES,
             "matrix_shape": [int(ref_counts.shape[0]), int(ref_counts.shape[1])],
             "plot": {
@@ -432,20 +438,111 @@ def run_tasic(
 
 
 # -----------------------------------------------------------------------------
-# 10x-HMB stub
+# 10x-HMB (ABC WMB-10X)
 # -----------------------------------------------------------------------------
 
 
-def run_10x_hmb_stub(out_root: Path) -> None:
+def run_10x_hmb(
+    out_root: Path,
+    label_level: str,
+    min_label_cells: int,
+    tenx_region: str,
+    tenx_expression_scale: str,
+    tenx_ref_classes: list[str] | None,
+    tenx_exclude_supertype_substrings: list[str] | None,
+    tenx_min_supertype_cells: int | None,
+    k: int,
+    dpi: int,
+    clip_max: float,
+    max_plot_cells: int,
+    max_plot_genes: int,
+    random_seed: int,
+) -> None:
+    print("\n" + "=" * 72)
+    print("10x-HMB: collecting WMB-10X reference cell×gene")
+    print("=" * 72)
+
     out_dir = out_root / "10x-hmb"
     out_dir.mkdir(parents=True, exist_ok=True)
-    msg = (
-        "10x-HMB implementation is pending.\n"
-        "Planned behavior: load VISp inhibitory cells, export cell_x_gene.csv, "
-        "and save k-means clustered cell_x_gene_clustered_kmeans.png.\n"
+
+    print("[10x-HMB 1/3] Loading WMB-10X reference counts from ABC Atlas...")
+    print(f"  Region: {tenx_region}")
+    print(f"  Expression scale: {tenx_expression_scale}")
+    if tenx_ref_classes:
+        print(f"  Class filter: {tenx_ref_classes}")
+    if tenx_exclude_supertype_substrings:
+        print(f"  Exclude supertype substrings: {tenx_exclude_supertype_substrings}")
+    if tenx_min_supertype_cells is not None:
+        print(f"  Min supertype cells: {tenx_min_supertype_cells}")
+
+    ref_counts, ref_labels = atlas_compare.load_abc_wmb_10x_reference(
+        abc_cache_dir=ABC_ATLAS_DIR,
+        genes=HCR_PANEL_GENES,
+        region_of_interest=tenx_region,
+        ref_classes=tenx_ref_classes,
+        exclude_supertype_substrings=tenx_exclude_supertype_substrings,
+        min_supertype_cells=tenx_min_supertype_cells,
+        label_level=label_level,
+        min_label_cells=min_label_cells,
+        expression_scale=tenx_expression_scale,
+        save_dir=None,
     )
-    (out_dir / "README_TODO.txt").write_text(msg)
-    print(f"10x-HMB placeholder written -> {out_dir / 'README_TODO.txt'}")
+
+    ref_counts = ref_counts.loc[:, ~ref_counts.columns.duplicated()].copy()
+    ref_counts = ref_counts.fillna(0)
+    ref_counts = _subset_to_hcr_panel(ref_counts, HCR_PANEL_GENES)
+    ref_labels = ref_labels.reindex(ref_counts.index)
+
+    print(
+        f"  Reference matrix: {ref_counts.shape[0]:,} cells x "
+        f"{ref_counts.shape[1]:,} genes"
+    )
+
+    print("[10x-HMB 2/3] Writing outputs...")
+    ref_counts.to_csv(out_dir / "cell_x_gene.csv")
+    ref_labels.to_frame(name=label_level).to_csv(out_dir / f"labels_{label_level}.csv")
+
+    print("[10x-HMB 3/3] Writing clustered PNG...")
+    _plot_clustered_cellxgene(
+        cxg=ref_counts,
+        out_png=out_dir / "cell_x_gene_clustered_kmeans.png",
+        title=f"10x-HMB {tenx_region} reference (k-means clustered)",
+        k=k,
+        dpi=dpi,
+        clip_max=clip_max,
+        max_plot_cells=max_plot_cells,
+        max_plot_genes=max_plot_genes,
+        random_seed=random_seed,
+    )
+
+    _write_run_metadata(
+        out_dir,
+        {
+            "dataset": "10x-HMB",
+            "source": "ABC Atlas WMB-10X",
+            "region_of_interest": tenx_region,
+            "expression_scale": tenx_expression_scale,
+            "ref_classes": tenx_ref_classes,
+            "exclude_supertype_substrings": tenx_exclude_supertype_substrings,
+            "min_supertype_cells": tenx_min_supertype_cells,
+            "label_level": label_level,
+            "min_label_cells": min_label_cells,
+            "hcr_panel_genes": HCR_PANEL_GENES,
+            "matrix_shape": [int(ref_counts.shape[0]), int(ref_counts.shape[1])],
+            "plot": {
+                "cluster_method": "kmeans",
+                "k": k,
+                "clip_range": [0, clip_max],
+                "max_plot_cells": max_plot_cells,
+                "max_plot_genes": max_plot_genes,
+                "random_seed": random_seed,
+                "dpi": dpi,
+            },
+        },
+    )
+
+    gc.collect()
+    print(f"  Saved 10x-HMB outputs -> {out_dir}")
 
 
 # -----------------------------------------------------------------------------
@@ -552,7 +649,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--datasets",
         nargs="+",
-        default=["merfish", "tasic", "hcr"],
+        default=["10x-hmb", "merfish", "tasic", "hcr"],
         choices=["merfish", "tasic", "hcr", "10x-hmb"],
         help="Reference datasets to run.",
     )
@@ -578,6 +675,41 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="MERFISH minimum cells per kept label.",
+    )
+    parser.add_argument(
+        "--merfish-expression-scale",
+        default="log2",
+        choices=["log2", "raw"],
+        help="MERFISH expression matrix to load from ABC Atlas.",
+    )
+    parser.add_argument(
+        "--tenx-region",
+        default="VIS",
+        help="Region acronym for WMB-10X (e.g., VIS).",
+    )
+    parser.add_argument(
+        "--tenx-expression-scale",
+        default="log2",
+        choices=["log2", "raw"],
+        help="WMB-10X expression matrix to load from ABC Atlas.",
+    )
+    parser.add_argument(
+        "--tenx-ref-classes",
+        nargs="+",
+        default=TENX_INHIBITORY_CLASSES,
+        help="Class labels to keep for WMB-10X filtering.",
+    )
+    parser.add_argument(
+        "--tenx-exclude-supertype-substrings",
+        nargs="+",
+        default=["L6"],
+        help="Drop WMB-10X cells whose supertype contains any of these substrings.",
+    )
+    parser.add_argument(
+        "--tenx-min-supertype-cells",
+        type=int,
+        default=10,
+        help="Keep only WMB-10X supertypes with at least this many cells.",
     )
     parser.add_argument(
         "--tasic-layer",
@@ -636,11 +768,30 @@ def main() -> None:
     print(f"Output root: {out_root}")
     print("#" * 72)
 
+    if "10x-hmb" in args.datasets:
+        run_10x_hmb(
+            out_root=out_root,
+            label_level=args.label_level,
+            min_label_cells=args.min_label_cells,
+            tenx_region=args.tenx_region,
+            tenx_expression_scale=args.tenx_expression_scale,
+            tenx_ref_classes=args.tenx_ref_classes,
+            tenx_exclude_supertype_substrings=args.tenx_exclude_supertype_substrings,
+            tenx_min_supertype_cells=args.tenx_min_supertype_cells,
+            k=args.k,
+            dpi=args.dpi,
+            clip_max=args.clip_max,
+            max_plot_cells=args.max_plot_cells,
+            max_plot_genes=args.max_plot_genes,
+            random_seed=args.random_seed,
+        )
+
     if "merfish" in args.datasets:
         run_merfish(
             out_root=out_root,
             label_level=args.label_level,
             min_label_cells=args.min_label_cells,
+            merfish_expression_scale=args.merfish_expression_scale,
             k=args.k,
             dpi=args.dpi,
             clip_max=args.clip_max,
@@ -672,9 +823,6 @@ def main() -> None:
             max_plot_genes=args.max_plot_genes,
             random_seed=args.random_seed,
         )
-
-    if "10x-hmb" in args.datasets:
-        run_10x_hmb_stub(out_root=out_root)
 
     print("\nDone.")
 
