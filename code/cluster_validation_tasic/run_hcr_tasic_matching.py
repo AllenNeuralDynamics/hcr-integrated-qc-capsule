@@ -457,6 +457,8 @@ def plot_gene_distributions_by_mouse(
     X_corr = hcr_corrected.X if not hasattr(hcr_corrected.X, "toarray") else hcr_corrected.X.toarray()
     mice = np.unique(hcr_log.obs["mouse_id"].values)
     mouse_colors = {"790322": "#1b9e77", "782149": "#d95f02", "788406": "#7570b3"}
+    mouse_order = [f"M{m}" for m in sorted(mice)]
+    mouse_palette = {f"M{k}": v for k, v in mouse_colors.items()}
 
     # --- Pre-correction grid ---
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 2.5, nrows * 2.5))
@@ -468,9 +470,10 @@ def plot_gene_distributions_by_mouse(
             "expression": X_log[:, gene_idx],
             "mouse_id": hcr_log.obs["mouse_id"].values,
         })
-        sns.violinplot(data=df, x="mouse_id", y="expression", ax=ax,
+        df["mouse_label"] = "M" + df["mouse_id"].astype(str)
+        sns.violinplot(data=df, x="mouse_label", y="expression", hue="mouse_label", ax=ax,
                        inner="quartile", density_norm="width", cut=0,
-                       palette=mouse_colors, order=sorted(mice))
+                       palette=mouse_palette, order=mouse_order, legend=False)
         ax.set_title(gene, fontsize=9, fontweight="bold")
         ax.set_xlabel("")
         ax.set_ylabel("")
@@ -493,9 +496,10 @@ def plot_gene_distributions_by_mouse(
             "expression": X_corr[:, gene_idx],
             "mouse_id": hcr_corrected.obs["mouse_id"].values,
         })
-        sns.violinplot(data=df, x="mouse_id", y="expression", ax=ax,
+        df["mouse_label"] = "M" + df["mouse_id"].astype(str)
+        sns.violinplot(data=df, x="mouse_label", y="expression", hue="mouse_label", ax=ax,
                        inner="quartile", density_norm="width", cut=0,
-                       palette=mouse_colors, order=sorted(mice))
+                       palette=mouse_palette, order=mouse_order, legend=False)
         ax.set_title(gene, fontsize=9, fontweight="bold")
         ax.set_xlabel("")
         ax.set_ylabel("")
@@ -1263,6 +1267,8 @@ def within_branch_leiden_clustering(
     branch_assignments: pd.DataFrame,
     n_neighbors_range: list[int] | None = None,
     resolution_range: list[float] | None = None,
+    selection_bootstraps: int = 10,
+    selection_subsample_frac: float = 0.8,
     min_cells_per_branch_cluster: int = 0,
 ) -> tuple[ad.AnnData, dict]:
     """
@@ -1315,8 +1321,10 @@ def within_branch_leiden_clustering(
     if resolution_range is None:
         resolution_range = [0.1, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0]
 
-    # Parameter sweep: test all param combinations and compute both ARI and silhouette
+    # Parameter sweep: evaluate each parameter pair with ARI, silhouette,
+    # and a quick bootstrap-stability estimate.
     sweep_rows = []
+    rng_sel = np.random.default_rng(0)
     for n_neighbors in n_neighbors_range:
         if n_neighbors >= adata_branch_cluster.n_obs:
             continue
@@ -1340,34 +1348,59 @@ def within_branch_leiden_clustering(
                 )
             else:
                 silhouette = np.nan
+
+            # Quick stability estimate: re-cluster subsamples and compare
+            # against full-data labels for the same parameter setting.
+            full_labels_test = adata_branch_cluster.obs["leiden_test"].astype(str).values
+            n_cells = adata_branch_cluster.n_obs
+            subsample_size = max(10, int(n_cells * selection_subsample_frac))
+            stab_scores = []
+            for _ in range(selection_bootstraps):
+                idx = rng_sel.choice(n_cells, size=subsample_size, replace=False)
+                adata_sub = adata_branch_cluster[idx].copy()
+                n_nb_sub = min(n_neighbors, adata_sub.n_obs - 1)
+                if n_nb_sub < 2:
+                    continue
+                sc.pp.neighbors(adata_sub, use_rep="X", n_neighbors=n_nb_sub)
+                sc.tl.leiden(adata_sub, resolution=resolution, flavor="igraph")
+                stab_scores.append(
+                    adjusted_rand_score(full_labels_test[idx], adata_sub.obs["leiden"].astype(str).values)
+                )
+
+            stability_mean = float(np.mean(stab_scores)) if stab_scores else np.nan
+            stability_std = float(np.std(stab_scores)) if stab_scores else np.nan
             
             sweep_rows.append({
                 "n_neighbors": n_neighbors,
                 "resolution": resolution,
                 "ari": ari,
                 "silhouette": silhouette,
+                "stability_mean": stability_mean,
+                "stability_std": stability_std,
                 "n_clusters": n_clusters_test,
             })
 
     sweep_df = pd.DataFrame(sweep_rows).reset_index(drop=True)
 
-    # ── Silhouette-first parameter selection ─────────────────────────────────
+    # ── Stability-first parameter selection ──────────────────────────────────
     # Strategy:
-    #   1. For each resolution, average silhouette across all n_neighbors tested.
-    #      → pick the resolution with the highest mean silhouette (panel-appropriate
-    #        cluster count, not chasing fine taxonomy splits).
-    #   2. At that resolution, pick the n_neighbors with the single best silhouette.
-    #   3. ARI is preserved in sweep_df for reference and diagnostics only.
-    valid = sweep_df[sweep_df["silhouette"].notna()]
-    if len(valid) == 0:
-        # Fall back to ARI if silhouette unavailable (e.g. <2 clusters)
-        print("      WARNING: silhouette unavailable for all combos, falling back to ARI")
-        best = sweep_df.sort_values("ari", ascending=False).iloc[0]
+    #   1. Pick the setting with the highest bootstrap stability_mean.
+    #   2. Break ties by silhouette, then ARI.
+    #   3. If stability is unavailable, fall back to silhouette then ARI.
+    valid_stab = sweep_df[sweep_df["stability_mean"].notna()].copy()
+    if len(valid_stab) > 0:
+        best = valid_stab.sort_values(
+            ["stability_mean", "silhouette", "ari"],
+            ascending=[False, False, False],
+        ).iloc[0]
     else:
-        mean_sil_by_res = valid.groupby("resolution")["silhouette"].mean()
-        best_r_sil = float(mean_sil_by_res.idxmax())
-        at_best_r = valid[valid["resolution"] == best_r_sil]
-        best = at_best_r.loc[at_best_r["silhouette"].idxmax()]
+        valid_sil = sweep_df[sweep_df["silhouette"].notna()]
+        if len(valid_sil) == 0:
+            print("      WARNING: stability/silhouette unavailable, falling back to ARI")
+            best = sweep_df.sort_values("ari", ascending=False).iloc[0]
+        else:
+            print("      WARNING: stability unavailable, selecting by silhouette")
+            best = valid_sil.sort_values(["silhouette", "ari"], ascending=[False, False]).iloc[0]
 
     best_n = int(best["n_neighbors"])
     best_r = float(best["resolution"])
@@ -1416,14 +1449,17 @@ def within_branch_leiden_clustering(
 
     n_clusters = adata_branch_cluster.obs["leiden"].nunique()
     best_sil = best["silhouette"] if pd.notna(best["silhouette"]) else float("nan")
+    best_stab = best["stability_mean"] if pd.notna(best["stability_mean"]) else float("nan")
     print(f"      Best params: n_neighbors={best_n}, resolution={best_r:.1f}, "
-          f"silhouette={best_sil:.3f}, ARI={best['ari']:.3f}, n_clusters={n_clusters}")
+          f"stability={best_stab:.3f}, silhouette={best_sil:.3f}, "
+          f"ARI={best['ari']:.3f}, n_clusters={n_clusters}")
 
     results_dict = {
         "sweep_df": sweep_df,
         "best_params": {
             "best_n_neighbors": best_n,
             "best_resolution": best_r,
+            "best_stability": float(best_stab),
             "best_ari": float(best["ari"]),
             "best_silhouette": float(best_sil),
         },
@@ -1435,7 +1471,7 @@ def within_branch_leiden_clustering(
 
 def bootstrap_branch_stability(
     adata_branch: ad.AnnData,
-    n_bootstraps: int = 20,
+    n_bootstraps: int = 50,
     subsample_frac: float = 0.8,
     n_neighbors: int | None = None,
     resolution: float | None = None,
@@ -1801,7 +1837,7 @@ def run_stage4(
     n_neighbors_gating: int = 15,
     confidence_threshold: float = 0.5,
     margin_threshold: float = 0.2,
-    n_bootstraps: int = 20,
+    n_bootstraps: int = 50,
     min_cells_per_branch_cluster: int = 0,
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     """
@@ -1969,14 +2005,30 @@ def run_stage4(
             random_state=0,
         )
 
-        # Build marker-derived names: "Pvalb-0: Calb1 | Reln | Tac1"
+        # Build marker-derived names while excluding subclass terms.
         high_conf = markers_df[
             (markers_df["stability_pct"] >= 80.0) & (markers_df["direction"] == "enriched")
         ]
+        # Exclude canonical/minor subclass labels from marker-name strings.
+        excluded_name_genes = {
+            g.lower() for g in (
+                list(CANONICAL_BRANCHES)
+                + ["Sncg"]
+                + list(MINOR_SUBCLASSES)
+            )
+        }
+
+        def _top_name_genes(df_in: pd.DataFrame, n: int = 3) -> list[str]:
+            genes = [
+                g for g in df_in["gene"].tolist()
+                if isinstance(g, str) and g.lower() not in excluded_name_genes
+            ]
+            return genes[:n]
+
         name_map = {}
         for cl in sorted(adata_branch.obs["branch_cluster"].unique()):
             cl_markers = high_conf[high_conf["cluster"] == cl].sort_values("rank")
-            marker_str = "-".join(cl_markers["gene"].head(3).tolist())
+            marker_str = "-".join(_top_name_genes(cl_markers, n=3))
             if marker_str:
                 name_map[cl] = f"{cl}: {marker_str}"
             else:
@@ -1984,7 +2036,7 @@ def run_stage4(
                 cl_enriched = markers_df[
                     (markers_df["cluster"] == cl) & (markers_df["direction"] == "enriched")
                 ].sort_values("rank")
-                marker_str = "-".join(cl_enriched["gene"].head(3).tolist())
+                marker_str = "-".join(_top_name_genes(cl_enriched, n=3))
                 name_map[cl] = f"{cl}: {marker_str}" if marker_str else cl
         branch_marker_names[branch] = name_map
 
@@ -2061,6 +2113,7 @@ def run_stage4(
             label_fontsize=8,
             cbar_label="z-score",
             title=f"{branch} branch: Tasic cells by Leiden cluster",
+            cmap="RdBu_r",
         )
         fig_cxg.savefig(branch_dir / f"{branch}_cell_x_gene_labeled.png",
                         dpi=150, bbox_inches="tight")
