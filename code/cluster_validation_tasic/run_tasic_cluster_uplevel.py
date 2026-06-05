@@ -41,9 +41,10 @@ import cluster_validation_utils
 DATA_DIR = Path("/root/capsule/data")
 SS_PATH = Path("/root/capsule/scratch/mouse_VISp_gene_expression_matrices_2018-06-14")
 OUT_ROOT = Path("/root/capsule/results/hcr_tasic_matching")
+TENX_HMB_DIR = Path("/root/capsule/scratch/reference_atlas_cellxgene/10x-hmb")
 
 # Mice with confirmed pairwise-unmixed inhibitory cell data
-MOUSE_IDS = ["790322", "788406"] # "782149"
+MOUSE_IDS = []#["790322", "788406"] # "782149"
 
 # Genes to exclude from the shared panel (non-biological / control)
 EXCLUDE_GENES = {"GFP"}
@@ -136,6 +137,88 @@ def normalize_hcr(adata: ad.AnnData) -> ad.AnnData:
     adata = adata.copy()
     adata.layers["raw"] = adata.X.copy()
     sc.pp.log1p(adata)
+    return adata
+
+
+def load_10x_hmb_query(
+    tenx_dir: Path = TENX_HMB_DIR,
+    label_column: str = "supertype",
+) -> ad.AnnData:
+    """
+    Load 10x-HMB cell-by-gene matrix and labels from pre-collected CSVs.
+
+    Expected files in tenx_dir:
+      - cell_x_gene.csv
+      - labels_supertype.csv
+    """
+    matrix_path = tenx_dir / "cell_x_gene.csv"
+    labels_path = tenx_dir / "labels_supertype.csv"
+
+    if not matrix_path.exists():
+        raise FileNotFoundError(f"10x matrix file not found: {matrix_path}")
+    if not labels_path.exists():
+        raise FileNotFoundError(f"10x labels file not found: {labels_path}")
+
+    cxg = pd.read_csv(matrix_path)
+    if "cell_label" in cxg.columns:
+        cxg = cxg.set_index("cell_label")
+    else:
+        cxg = cxg.set_index(cxg.columns[0])
+    cxg.index = cxg.index.astype(str)
+
+    labels_df = pd.read_csv(labels_path)
+    if "cell_label" in labels_df.columns:
+        labels_df = labels_df.set_index("cell_label")
+    else:
+        labels_df = labels_df.set_index(labels_df.columns[0])
+    labels_df.index = labels_df.index.astype(str)
+
+    if label_column not in labels_df.columns:
+        raise ValueError(
+            f"Label column '{label_column}' not found in {labels_path}. "
+            f"Available columns: {labels_df.columns.tolist()}"
+        )
+
+    # Align labels to matrix rows and keep matrix row order.
+    labels = labels_df[label_column].reindex(cxg.index)
+    missing = labels.isna().sum()
+    if missing > 0:
+        print(f"  WARNING: {missing} cells missing '{label_column}' labels; filling with 'unlabeled'.")
+        labels = labels.fillna("unlabeled")
+
+    cxg = cxg.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    adata = ad.AnnData(
+        X=cxg.values.astype(np.float32),
+        obs=pd.DataFrame(index=cxg.index),
+        var=pd.DataFrame(index=cxg.columns.astype(str)),
+    )
+    adata.obs[label_column] = labels.astype(str).values
+    adata.obs["mouse_id"] = "10x-hmb"
+    adata.obs["dataset"] = "10x-hmb"
+    print(f"  10x-HMB loaded: {adata.n_obs} cells, {adata.n_vars} genes")
+    return adata
+
+
+def normalize_10x_hmb(
+    adata: ad.AnnData,
+    expression_scale: str = "log2",
+) -> ad.AnnData:
+    """
+    Normalize 10x-HMB expression matrix before per-gene z-scoring.
+
+    expression_scale:
+      - "log2": matrix is already log-scaled; use as-is.
+      - "raw": apply log1p.
+    """
+    adata = adata.copy()
+    adata.layers["raw"] = adata.X.copy()
+    if expression_scale == "raw":
+        sc.pp.log1p(adata)
+    elif expression_scale == "log2":
+        pass
+    else:
+        raise ValueError("expression_scale must be one of: 'log2', 'raw'")
     return adata
 
 
@@ -1832,7 +1915,7 @@ def print_sweep_summary(
 def run_stage4(
     tasic_log: ad.AnnData,
     tasic_z: ad.AnnData,
-    hcr_corrected: ad.AnnData,
+    hcr_corrected: ad.AnnData | None,
     out_dir: Path,
     n_neighbors_gating: int = 15,
     confidence_threshold: float = 0.5,
@@ -1855,8 +1938,8 @@ def run_stage4(
         Log-normalized Tasic inhibitory cells (used for within-branch clustering).
     tasic_z : AnnData
         Z-scored Tasic inhibitory cells (used for matching features and gating).
-    hcr_corrected : AnnData
-        Batch-corrected z-scored HCR cells.
+    hcr_corrected : AnnData | None
+        Batch-corrected z-scored HCR cells. If None, skip HCR gating.
     out_dir : Path
         Output directory.
     n_neighbors_gating : int
@@ -1928,18 +2011,27 @@ def run_stage4(
         frac = count / len(tasic_gating)
         print(f"    {branch}: {count} ({frac:.1%})")
 
-    # Gate HCR cells
-    print("\n  Gating HCR cells...")
-    hcr_gating = soft_subclass_gating(
-        hcr_corrected, tasic_z,
-        n_neighbors=n_neighbors_gating,
-        confidence_threshold=confidence_threshold,
-        margin_threshold=margin_threshold,
-    )
-    print("\n  HCR gating summary:")
-    for branch, count in hcr_gating["assigned_branch"].value_counts().items():
-        frac = count / len(hcr_gating)
-        print(f"    {branch}: {count} ({frac:.1%})")
+    if hcr_corrected is not None:
+        # Gate HCR cells
+        print("\n  Gating HCR cells...")
+        hcr_gating = soft_subclass_gating(
+            hcr_corrected, tasic_z,
+            n_neighbors=n_neighbors_gating,
+            confidence_threshold=confidence_threshold,
+            margin_threshold=margin_threshold,
+        )
+        print("\n  HCR gating summary:")
+        for branch, count in hcr_gating["assigned_branch"].value_counts().items():
+            frac = count / len(hcr_gating)
+            print(f"    {branch}: {count} ({frac:.1%})")
+    else:
+        hcr_gating = pd.DataFrame(
+            columns=[
+                "cell_id", "assigned_branch", "confidence", "margin", "top_prob",
+                "second_prob", "top_label", "second_label",
+            ]
+        )
+        print("\n  HCR gating skipped (no HCR query provided).")
 
     # -------------------------------------------------------------------------
     # 4.2 Within-branch Leiden clustering on Tasic reference
@@ -2178,6 +2270,71 @@ def run_stage4(
     return branch_results, tasic_gating, hcr_gating, branch_marker_names
 
 
+def load_stage4_cached(out_dir: Path) -> tuple[dict, pd.DataFrame, pd.DataFrame, dict]:
+    """
+    Load Stage 4 cached outputs from disk.
+
+    Required files:
+    - stage4/tasic_gating.csv
+    - stage4/hcr_gating.csv
+    - stage4/{branch}/{Branch}_branch_tasic.h5ad
+    - stage4/{branch}/{Branch}_cluster_names.csv
+    """
+    stage4_dir = out_dir / "stage4"
+    tasic_gating_path = stage4_dir / "tasic_gating.csv"
+    hcr_gating_path = stage4_dir / "hcr_gating.csv"
+
+    if not tasic_gating_path.exists() or not hcr_gating_path.exists():
+        raise FileNotFoundError(
+            "Missing stage4 gating tables; expected "
+            f"{tasic_gating_path} and {hcr_gating_path}"
+        )
+
+    tasic_gating = pd.read_csv(tasic_gating_path)
+    hcr_gating = pd.read_csv(hcr_gating_path)
+
+    branch_results = {}
+    branch_marker_names = {}
+
+    for branch in CANONICAL_BRANCHES:
+        branch_dir = stage4_dir / branch.lower()
+        h5ad_path = branch_dir / f"{branch}_branch_tasic.h5ad"
+        names_path = branch_dir / f"{branch}_cluster_names.csv"
+
+        if not h5ad_path.exists() or not names_path.exists():
+            continue
+
+        adata_br = ad.read_h5ad(h5ad_path)
+        if "leiden" in adata_br.obs.columns:
+            n_clusters = int(pd.Series(adata_br.obs["leiden"]).nunique())
+        elif "branch_cluster" in adata_br.obs.columns:
+            n_clusters = int(pd.Series(adata_br.obs["branch_cluster"]).nunique())
+        else:
+            n_clusters = 0
+
+        res_dict = {
+            "skip": False,
+            "n_cells": int(adata_br.n_obs),
+            "n_clusters": n_clusters,
+        }
+        branch_results[branch] = (adata_br, res_dict)
+
+        names_df = pd.read_csv(names_path)
+        if {"branch_cluster", "marker_name"}.issubset(names_df.columns):
+            branch_marker_names[branch] = dict(
+                zip(names_df["branch_cluster"].astype(str), names_df["marker_name"].astype(str))
+            )
+        else:
+            branch_marker_names[branch] = {}
+
+    if len(branch_results) == 0:
+        raise FileNotFoundError(
+            f"No cached branch h5ad files found under {stage4_dir} for canonical branches {CANONICAL_BRANCHES}."
+        )
+
+    return branch_results, tasic_gating, hcr_gating, branch_marker_names
+
+
 # =============================================================================
 # Stage 5 — Matching: HCR cells → Panel-Resolution Reference
 # =============================================================================
@@ -2263,6 +2420,1031 @@ def score_marker_sets(
             scores[name] = np.zeros(X_z.shape[0])
 
     return pd.DataFrame(scores)
+
+
+def summarize_label_mapping(
+    assignments_df: pd.DataFrame,
+    label_col: str,
+    out_dir: Path,
+    prefix: str,
+    low_conf_threshold: float = 0.3,
+) -> None:
+    """
+    Summarize how source labels map to assigned Tasic-derived clusters.
+
+    Saves count/fraction tables, per-label quality metrics, and heatmap plots.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    required_cols = {label_col, "assignment", "confidence"}
+    missing_cols = required_cols - set(assignments_df.columns)
+    if missing_cols:
+        raise ValueError(f"Missing columns for mapping summary: {sorted(missing_cols)}")
+
+    counts = pd.crosstab(assignments_df[label_col], assignments_df["assignment"])
+    counts.to_csv(out_dir / f"{prefix}_counts.csv")
+
+    row_frac = counts.div(counts.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+    col_frac = counts.div(counts.sum(axis=0).replace(0, np.nan), axis=1).fillna(0)
+    row_frac.to_csv(out_dir / f"{prefix}_row_fraction.csv")
+    col_frac.to_csv(out_dir / f"{prefix}_col_fraction.csv")
+
+    # Top mappings per source label.
+    top_rows = []
+    for src_label in row_frac.index:
+        row = row_frac.loc[src_label].sort_values(ascending=False)
+        for rank, (dst_label, frac) in enumerate(row.head(3).items(), start=1):
+            top_rows.append(
+                {
+                    label_col: src_label,
+                    "rank": rank,
+                    "assignment": dst_label,
+                    "fraction": float(frac),
+                    "count": int(counts.loc[src_label, dst_label]),
+                }
+            )
+    pd.DataFrame(top_rows).to_csv(out_dir / f"{prefix}_top3_mappings.csv", index=False)
+
+    # Per-source label quality metrics.
+    metrics_rows = []
+    for src_label, df_sub in assignments_df.groupby(label_col, observed=False):
+        n = len(df_sub)
+        cnt = df_sub["assignment"].value_counts()
+        top_assignment = cnt.index[0] if len(cnt) > 0 else "NA"
+        top_frac = float(cnt.iloc[0] / n) if n > 0 else 0.0
+        probs = (cnt / n).values if n > 0 else np.array([0.0])
+        entropy = float(-(probs * np.log2(probs + 1e-12)).sum())
+        metrics_rows.append(
+            {
+                label_col: src_label,
+                "n_cells": int(n),
+                "mean_confidence": float(df_sub["confidence"].mean()),
+                "median_confidence": float(df_sub["confidence"].median()),
+                "low_conf_fraction": float((df_sub["confidence"] < low_conf_threshold).mean()),
+                "top_assignment": top_assignment,
+                "top_assignment_fraction": top_frac,
+                "assignment_entropy": entropy,
+            }
+        )
+    metrics_df = pd.DataFrame(metrics_rows).sort_values("n_cells", ascending=False)
+    metrics_df.to_csv(out_dir / f"{prefix}_quality_by_{label_col}.csv", index=False)
+
+    def _infer_subclass(label: str) -> str:
+        s = str(label).lower()
+        for sub in ["Lamp5", "Vip", "Sst", "Pvalb", "Sncg", "Serpinf1", "Meis2"]:
+            if sub.lower() in s:
+                return sub
+        return "Other"
+
+    subclass_order = ["Lamp5", "Vip", "Sst", "Pvalb", "Sncg", "Serpinf1", "Meis2", "Other"]
+    subclass_rank = {k: i for i, k in enumerate(subclass_order)}
+    subclass_colors = {
+        "Lamp5": "#4DAF4A",
+        "Vip": "#984EA3",
+        "Sst": "#E41A1C",
+        "Pvalb": "#377EB8",
+        "Sncg": "#FF7F00",
+        "Serpinf1": "#A65628",
+        "Meis2": "#666666",
+        "Other": "#333333",
+    }
+
+    def _sort_labels(labels: list[str], score_map: dict[str, float]) -> list[str]:
+        return sorted(
+            labels,
+            key=lambda x: (
+                subclass_rank.get(_infer_subclass(x), len(subclass_rank)),
+                -float(score_map.get(x, 0.0)),
+                str(x),
+            ),
+        )
+
+    def _group_boundaries(labels: list[str]) -> list[int]:
+        if not labels:
+            return []
+        groups = [_infer_subclass(x) for x in labels]
+        bounds = []
+        for i in range(1, len(groups)):
+            if groups[i] != groups[i - 1]:
+                bounds.append(i)
+        return bounds
+
+    def _style_axis(ax, row_labels: list[str], col_labels: list[str]) -> None:
+        # Color tick labels by inferred subclass for fast visual matching.
+        for tick in ax.get_yticklabels():
+            sub = _infer_subclass(tick.get_text())
+            tick.set_color(subclass_colors.get(sub, "#333333"))
+        for tick in ax.get_xticklabels():
+            sub = _infer_subclass(tick.get_text())
+            tick.set_color(subclass_colors.get(sub, "#333333"))
+
+        # Draw separators where inferred subclass changes.
+        for b in _group_boundaries(row_labels):
+            ax.axhline(b, color="white", lw=1.2)
+        for b in _group_boundaries(col_labels):
+            ax.axvline(b, color="white", lw=1.2)
+
+    # Heatmaps for top labels/clusters to keep figure readable.
+    top_src = counts.sum(axis=1).sort_values(ascending=False).head(40).index
+    top_dst = counts.sum(axis=0).sort_values(ascending=False).head(30).index
+
+    src_scores = counts.sum(axis=1).to_dict()
+    dst_scores = counts.sum(axis=0).to_dict()
+    row_order = _sort_labels([str(x) for x in top_src.tolist()], src_scores)
+    col_order = _sort_labels([str(x) for x in top_dst.tolist()], dst_scores)
+
+    row_view = row_frac.loc[row_order, col_order]
+    count_view = counts.loc[row_order, col_order]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, max(6, 0.25 * len(top_src))))
+    sns.heatmap(
+        row_view,
+        ax=axes[0],
+        cmap="viridis",
+        vmin=0,
+        vmax=1,
+        cbar_kws={"label": "Row-normalized fraction"},
+    )
+    axes[0].set_title(f"{prefix}: {label_col} -> assignment (row fraction, subclass-grouped)")
+    axes[0].tick_params(axis="x", rotation=90, labelsize=7)
+    axes[0].tick_params(axis="y", rotation=0, labelsize=7)
+    _style_axis(axes[0], row_order, col_order)
+
+    sns.heatmap(
+        np.log10(count_view + 1),
+        ax=axes[1],
+        cmap="magma",
+        cbar_kws={"label": "log10(count + 1)"},
+    )
+    axes[1].set_title(f"{prefix}: {label_col} -> assignment (counts, subclass-grouped)")
+    axes[1].tick_params(axis="x", rotation=90, labelsize=7)
+    axes[1].tick_params(axis="y", rotation=0, labelsize=7)
+    _style_axis(axes[1], row_order, col_order)
+
+    # Compact legend for subclass colors.
+    legend_order = [s for s in subclass_order if s in {_infer_subclass(x) for x in row_order + col_order}]
+    handles = [
+        plt.Line2D([0], [0], marker="s", linestyle="", markerfacecolor=subclass_colors[s],
+                   markeredgecolor=subclass_colors[s], markersize=7, label=s)
+        for s in legend_order
+    ]
+    if handles:
+        axes[1].legend(handles=handles, title="Inferred subclass", loc="upper left",
+                       bbox_to_anchor=(1.02, 1.0), fontsize=7, title_fontsize=8)
+
+    plt.tight_layout()
+    fig.savefig(out_dir / f"{prefix}_mapping_heatmaps.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def build_merge_overall_report(
+    assignments_df: pd.DataFrame,
+    label_col: str,
+    out_dir: Path,
+    prefix: str,
+) -> None:
+    """
+    Build destination-centric merge reports.
+
+    These tables answer: for each assigned Tasic cluster, which source labels
+    (e.g. 10x supertypes) flow into it, and how concentrated that merge is.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    required_cols = {label_col, "assignment", "confidence"}
+    missing_cols = required_cols - set(assignments_df.columns)
+    if missing_cols:
+        raise ValueError(f"Missing columns for merge report: {sorted(missing_cols)}")
+
+    counts = pd.crosstab(assignments_df[label_col], assignments_df["assignment"])
+    if counts.empty:
+        return
+
+    # Metrics from both perspectives.
+    # - within_cluster_frac: source label contribution within a destination cluster.
+    # - within_label_frac: fraction of a source label assigned into a destination cluster.
+    within_cluster = counts.div(counts.sum(axis=0).replace(0, np.nan), axis=1).fillna(0)
+    within_label = counts.div(counts.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+
+    ranked_rows = []
+    summary_rows = []
+
+    for assignment in counts.columns:
+        col_counts = counts[assignment]
+        total = int(col_counts.sum())
+        nonzero = col_counts[col_counts > 0].sort_values(ascending=False)
+
+        if total == 0:
+            continue
+
+        probs = (nonzero / total).values
+        entropy = float(-(probs * np.log2(probs + 1e-12)).sum())
+        top3_frac = float((nonzero.head(3).sum()) / total)
+        dominant_label = str(nonzero.index[0])
+        dominant_frac = float(nonzero.iloc[0] / total)
+
+        assignment_df = assignments_df[assignments_df["assignment"] == assignment]
+        mean_conf = float(assignment_df["confidence"].mean()) if len(assignment_df) > 0 else float("nan")
+
+        summary_rows.append(
+            {
+                "assignment": assignment,
+                "n_cells": total,
+                "n_source_labels": int(len(nonzero)),
+                "dominant_source_label": dominant_label,
+                "dominant_source_fraction": dominant_frac,
+                "top3_source_fraction": top3_frac,
+                "source_entropy": entropy,
+                "mean_confidence": mean_conf,
+            }
+        )
+
+        for rank, (src_label, cnt) in enumerate(nonzero.items(), start=1):
+            ranked_rows.append(
+                {
+                    "assignment": assignment,
+                    "rank": rank,
+                    label_col: src_label,
+                    "count": int(cnt),
+                    "within_cluster_frac": float(within_cluster.loc[src_label, assignment]),
+                    "within_label_frac": float(within_label.loc[src_label, assignment]),
+                }
+            )
+
+    ranked_df = pd.DataFrame(ranked_rows).sort_values(["assignment", "rank"])
+    summary_df = pd.DataFrame(summary_rows).sort_values("n_cells", ascending=False)
+
+    ranked_df.to_csv(out_dir / f"{prefix}_ranked_sources_per_assignment.csv", index=False)
+    summary_df.to_csv(out_dir / f"{prefix}_assignment_merge_summary.csv", index=False)
+
+    # Compact view: top 5 source labels per destination cluster.
+    top5 = ranked_df[ranked_df["rank"] <= 5].copy()
+    top5.to_csv(out_dir / f"{prefix}_top5_sources_per_assignment.csv", index=False)
+
+    # Plot: dominant source fraction vs size for each destination cluster.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = summary_df["n_cells"].values
+    y = summary_df["dominant_source_fraction"].values
+    ax.scatter(x, y, s=40, alpha=0.8)
+    for _, row in summary_df.iterrows():
+        ax.text(row["n_cells"], row["dominant_source_fraction"], str(row["assignment"]), fontsize=6)
+    ax.set_xscale("log")
+    ax.set_xlabel("Assigned cluster size (log scale)")
+    ax.set_ylabel("Dominant source fraction")
+    ax.set_title(f"{prefix}: merge concentration by assigned cluster")
+    ax.set_ylim(0, 1.02)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(out_dir / f"{prefix}_merge_concentration.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_stage5_10x_hmb(
+    tenx_z: ad.AnnData,
+    tasic_z: ad.AnnData,
+    centroids_collapsed: pd.DataFrame,
+    branch_results: dict,
+    tenx_gating: pd.DataFrame,
+    branch_marker_names: dict,
+    out_dir: Path,
+    label_col: str = "supertype",
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """
+    Match 10x-HMB query cells into Tasic-derived cluster references.
+
+    Outputs:
+    - Approach A assignments (collapsed Tasic centroids)
+    - Approach C assignments (branch-wise Leiden-named clusters)
+    - Supertype-to-assignment mapping summaries and quality metrics
+    """
+    print("\n" + "=" * 60)
+    print("STAGE 5-10X: Matching — 10x-HMB Cells → Tasic Reference")
+    print("=" * 60)
+
+    stage5_dir = out_dir / "stage5_10x_hmb"
+    stage5_dir.mkdir(parents=True, exist_ok=True)
+
+    genes = list(tasic_z.var_names)
+    X_q = tenx_z.X if not hasattr(tenx_z.X, "toarray") else tenx_z.X.toarray()
+    X_q = np.asarray(X_q, dtype=np.float64)
+
+    if not set(genes).issubset(set(tenx_z.var_names)):
+        raise ValueError("10x query genes are not aligned with Tasic genes.")
+
+    # Reorder query matrix to Tasic gene order.
+    tenx_aligned = tenx_z[:, genes].copy()
+    X_q = tenx_aligned.X if not hasattr(tenx_aligned.X, "toarray") else tenx_aligned.X.toarray()
+    X_q = np.asarray(X_q, dtype=np.float64)
+
+    # Approach A
+    print("\n[5x.1] Approach A matching (collapsed centroids)...")
+    centroids_a = centroids_collapsed[genes]
+    assignments_a, confidences_a, _ = centroid_correlation_matching(X_q, centroids_a)
+
+    tenx_assignments_a = pd.DataFrame(
+        {
+            "cell_id": tenx_aligned.obs_names,
+            "assignment": assignments_a,
+            "confidence": confidences_a,
+            label_col: tenx_aligned.obs[label_col].values,
+            "mouse_id": tenx_aligned.obs["mouse_id"].values,
+        }
+    )
+
+    print(f"  Mean confidence: {confidences_a.mean():.3f} ± {confidences_a.std():.3f}")
+    print(f"  Low-confidence (r<0.3): {(confidences_a < 0.3).sum()} ({(confidences_a < 0.3).mean():.1%})")
+
+    # Approach C
+    tenx_assignments_c = None
+    if branch_results:
+        print("\n[5x.2] Approach C matching (branch-wise Leiden-named)...")
+        c_rows = []
+        for branch in CANONICAL_BRANCHES:
+            if branch not in branch_results:
+                continue
+            adata_branch, res_dict = branch_results[branch]
+            if res_dict.get("skip"):
+                continue
+
+            X_br = adata_branch.X if not hasattr(adata_branch.X, "toarray") else adata_branch.X.toarray()
+            df_br = pd.DataFrame(X_br, columns=adata_branch.var_names)
+            df_br["_cluster"] = adata_branch.obs["branch_cluster"].values
+            branch_centroids = df_br.groupby("_cluster", observed=True)[genes].mean()
+            name_map = branch_marker_names.get(branch, {})
+
+            q_cell_ids = tenx_gating[tenx_gating["assigned_branch"] == branch]["cell_id"].values
+            q_mask = tenx_aligned.obs_names.isin(q_cell_ids)
+            X_branch_q = X_q[q_mask]
+            if X_branch_q.shape[0] == 0:
+                continue
+
+            br_assignments, br_confidences, _ = centroid_correlation_matching(X_branch_q, branch_centroids)
+            for j, cell_id in enumerate(tenx_aligned.obs_names[q_mask]):
+                raw_label = br_assignments[j]
+                named_label = name_map.get(raw_label, raw_label)
+                c_rows.append(
+                    {
+                        "cell_id": cell_id,
+                        "branch": branch,
+                        "leiden_cluster": raw_label,
+                        "assignment": named_label,
+                        "confidence": br_confidences[j],
+                        label_col: tenx_aligned.obs.loc[cell_id, label_col],
+                        "mouse_id": "10x-hmb",
+                    }
+                )
+
+            print(
+                f"    {branch}: {X_branch_q.shape[0]} cells -> "
+                f"{len(set(br_assignments))} clusters, mean r={br_confidences.mean():.3f}"
+            )
+
+        if c_rows:
+            tenx_assignments_c = pd.DataFrame(c_rows)
+
+    # Save assignments
+    tenx_assignments_a.to_csv(stage5_dir / "tenx_assignments_approach_a.csv", index=False)
+    if tenx_assignments_c is not None:
+        tenx_assignments_c.to_csv(stage5_dir / "tenx_assignments_leiden_named.csv", index=False)
+
+    # Mapping summaries
+    print("\n[5x.3] Supertype-to-cluster mapping summaries...")
+    summarize_label_mapping(
+        tenx_assignments_a,
+        label_col=label_col,
+        out_dir=stage5_dir,
+        prefix="approach_a_supertype_to_tasic",
+    )
+    build_merge_overall_report(
+        tenx_assignments_a,
+        label_col=label_col,
+        out_dir=stage5_dir,
+        prefix="approach_a_merge_overall",
+    )
+    if tenx_assignments_c is not None:
+        summarize_label_mapping(
+            tenx_assignments_c,
+            label_col=label_col,
+            out_dir=stage5_dir,
+            prefix="approach_c_supertype_to_tasic",
+        )
+        build_merge_overall_report(
+            tenx_assignments_c,
+            label_col=label_col,
+            out_dir=stage5_dir,
+            prefix="approach_c_merge_overall",
+        )
+
+    # Gating-level supertype -> branch map
+    gating_df = tenx_gating.copy()
+    label_lookup = tenx_aligned.obs[[label_col]].copy()
+    label_lookup["cell_id"] = label_lookup.index.astype(str)
+    label_lookup = label_lookup[["cell_id", label_col]]
+    gating_df = gating_df.merge(
+        label_lookup,
+        on="cell_id",
+        how="left",
+    )
+    gating_df.to_csv(stage5_dir / "tenx_gating_with_labels.csv", index=False)
+    branch_ct = pd.crosstab(gating_df[label_col], gating_df["assigned_branch"])
+    branch_ct.to_csv(stage5_dir / "supertype_to_branch_counts.csv")
+    branch_frac = branch_ct.div(branch_ct.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+    branch_frac.to_csv(stage5_dir / "supertype_to_branch_row_fraction.csv")
+
+    fig, ax = plt.subplots(figsize=(10, max(6, 0.25 * len(branch_frac))))
+    sns.heatmap(branch_frac, cmap="Blues", vmin=0, vmax=1, ax=ax,
+                cbar_kws={"label": "Row-normalized fraction"})
+    ax.set_title("10x-HMB supertype -> gated branch")
+    ax.tick_params(axis="x", rotation=45)
+    ax.tick_params(axis="y", rotation=0, labelsize=7)
+    plt.tight_layout()
+    fig.savefig(stage5_dir / "supertype_to_branch_heatmap.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    summary = {
+        "n_10x_cells": int(tenx_aligned.n_obs),
+        "n_genes": int(tenx_aligned.n_vars),
+        "approach_a_mean_confidence": float(tenx_assignments_a["confidence"].mean()),
+        "approach_a_low_conf_fraction": float((tenx_assignments_a["confidence"] < 0.3).mean()),
+        "approach_a_n_unique_labels": int(tenx_assignments_a["assignment"].nunique()),
+    }
+    if tenx_assignments_c is not None:
+        summary["approach_c_n_cells"] = int(len(tenx_assignments_c))
+        summary["approach_c_mean_confidence"] = float(tenx_assignments_c["confidence"].mean())
+        summary["approach_c_n_unique_labels"] = int(tenx_assignments_c["assignment"].nunique())
+    pd.Series(summary).to_csv(stage5_dir / "tenx_matching_summary.csv", header=["value"])
+
+    # Matching quality tri-panel diagnostic
+    print("\n[5x.4] Generating matching quality diagnostics...")
+    _plot_10x_matching_diagnostics(
+        tenx_assignments=tenx_assignments_c if tenx_assignments_c is not None else tenx_assignments_a,
+        tenx_z=tenx_aligned,
+        tasic_z=tasic_z,
+        branch_results=branch_results,
+        branch_marker_names=branch_marker_names,
+        label_col=label_col,
+        genes=genes,
+        out_dir=stage5_dir,
+    )
+
+    print(f"\n  Stage 5-10x complete. Outputs in {stage5_dir}")
+    return tenx_assignments_a, tenx_assignments_c
+
+
+def _plot_10x_matching_diagnostics(
+    tenx_assignments: pd.DataFrame,
+    tenx_z: ad.AnnData,
+    tasic_z: ad.AnnData,
+    branch_results: dict,
+    branch_marker_names: dict,
+    label_col: str,
+    genes: list[str],
+    out_dir: Path,
+    n_worst: int = 20,
+) -> None:
+    """
+    Tri-panel matching quality diagnostic for 10x-HMB:
+      Panel A: supertype confidence vs assignment fragmentation scatter
+      Panel B: gene residual heatmap for worst-matching supertype×cluster links
+      Panel C: per-supertype confidence CDF by subclass
+    """
+    subclass_colors = {
+        "Lamp5": "#4DAF4A", "Vip": "#984EA3", "Sst": "#E41A1C",
+        "Pvalb": "#377EB8", "Sncg": "#FF7F00", "Serpinf1": "#A65628",
+        "Meis2": "#666666", "Other": "#333333",
+    }
+    subclass_order = ["Lamp5", "Vip", "Sst", "Pvalb", "Sncg", "Serpinf1", "Meis2", "Other"]
+
+    def _infer_sub(label: str) -> str:
+        s = str(label).lower()
+        for sub in subclass_order:
+            if sub.lower() in s:
+                return sub
+        return "Other"
+
+    required = {label_col, "assignment", "confidence"}
+    if not required.issubset(tenx_assignments.columns):
+        print("  Skipping matching diagnostics (missing columns).")
+        return
+
+    # ------------------------------------------------------------------ #
+    # Pre-compute per-supertype stats
+    # ------------------------------------------------------------------ #
+    rows = []
+    for src, grp in tenx_assignments.groupby(label_col, observed=False):
+        n = len(grp)
+        cnt = grp["assignment"].value_counts()
+        probs = (cnt / n).values
+        entropy = float(-(probs * np.log2(probs + 1e-12)).sum())
+        rows.append({
+            label_col: str(src),
+            "n_cells": n,
+            "mean_conf": float(grp["confidence"].mean()),
+            "entropy": entropy,
+            "top_frac": float(probs[0]) if len(probs) else 0.0,
+            "subclass": _infer_sub(str(src)),
+            "top_assignment": str(cnt.index[0]) if len(cnt) else "NA",
+        })
+    stats_df = pd.DataFrame(rows)
+    if stats_df.empty:
+        return
+
+    # ------------------------------------------------------------------ #
+    # Build per-assignment centroids from Tasic branch results
+    # ------------------------------------------------------------------ #
+    centroid_rows = []
+    for branch in CANONICAL_BRANCHES:
+        if branch not in branch_results:
+            continue
+        adata_br, res_dict = branch_results[branch]
+        if res_dict.get("skip"):
+            continue
+        name_map = branch_marker_names.get(branch, {})
+        X_br = adata_br.X if not hasattr(adata_br.X, "toarray") else adata_br.X.toarray()
+        df_br = pd.DataFrame(X_br, columns=adata_br.var_names, index=adata_br.obs_names)
+        df_br["_named"] = [name_map.get(cl, cl) for cl in adata_br.obs["branch_cluster"].values]
+        for named_lbl, g in df_br.groupby("_named", observed=True)[genes].mean().iterrows():
+            centroid_rows.append({"assignment": named_lbl, **g.to_dict()})
+    tasic_centroids = pd.DataFrame(centroid_rows).set_index("assignment") if centroid_rows else pd.DataFrame()
+
+    # ------------------------------------------------------------------ #
+    # Gene residuals: per supertype mean(10x z) - matched centroid z
+    # ------------------------------------------------------------------ #
+    X_q = tenx_z.X if not hasattr(tenx_z.X, "toarray") else tenx_z.X.toarray()
+    X_q = np.asarray(X_q, dtype=np.float64)
+    cell_df = pd.DataFrame(X_q, columns=tenx_z.var_names, index=tenx_z.obs_names)
+
+    residual_rows = []
+    for src, grp in tenx_assignments.groupby(label_col, observed=False):
+        cells = grp["cell_id"].values
+        cells_present = [c for c in cells if c in cell_df.index]
+        if not cells_present:
+            continue
+        x_mean = cell_df.loc[cells_present, genes].mean()
+        top_assign = grp["assignment"].value_counts().index[0]
+        mean_conf = float(grp["confidence"].mean())
+        if tasic_centroids is not None and top_assign in tasic_centroids.index:
+            centroid = tasic_centroids.loc[top_assign, genes]
+            residual = (x_mean - centroid).values
+        else:
+            residual = x_mean.values * 0.0
+        residual_rows.append({
+            "label": str(src),
+            "top_assignment": top_assign,
+            "mean_conf": mean_conf,
+            "subclass": _infer_sub(str(src)),
+            **{f"res_{g}": float(v) for g, v in zip(genes, residual)},
+        })
+    resid_df = pd.DataFrame(residual_rows)
+
+    if not resid_df.empty:
+        resid_df = resid_df.sort_values("mean_conf")
+        worst_n = resid_df.head(n_worst)
+        gene_cols = [c for c in worst_n.columns if c.startswith("res_")]
+        resid_matrix = worst_n[gene_cols].values
+        row_labels = [f"{r['label']} → {r['top_assignment']} (r={r['mean_conf']:.2f})"
+                      for _, r in worst_n.iterrows()]
+        col_labels = [g[4:] for g in gene_cols]  # strip "res_"
+    else:
+        resid_matrix = np.zeros((1, len(genes)))
+        row_labels = ["no data"]
+        col_labels = genes
+        worst_n = pd.DataFrame()
+
+    # ------------------------------------------------------------------ #
+    # Per-supertype ranking metrics: profile fidelity + residual spread
+    # ------------------------------------------------------------------ #
+    ranking_rows = []
+    if tasic_centroids is not None and not tasic_centroids.empty:
+        for _, row in stats_df.iterrows():
+            src = str(row[label_col])
+            top_assign = str(row["top_assignment"])
+            cells = tenx_assignments.loc[
+                tenx_assignments[label_col] == src, "cell_id"
+            ].values
+            cells_present = [c for c in cells if c in cell_df.index]
+            if not cells_present or top_assign not in tasic_centroids.index:
+                continue
+
+            mean_expr = cell_df.loc[cells_present, genes].mean().values.astype(np.float64)
+            centroid_vec = tasic_centroids.loc[top_assign, genes].values.astype(np.float64)
+            cell_matrix = cell_df.loc[cells_present, genes].values.astype(np.float64)
+
+            profile_r = float(np.corrcoef(mean_expr, centroid_vec)[0, 1])
+            if np.isnan(profile_r):
+                profile_r = 0.0
+            residual_mean = mean_expr - centroid_vec
+            residual_cell = cell_matrix - centroid_vec[None, :]
+            residual_rms = float(np.sqrt(np.mean(residual_mean ** 2)))
+            residual_spread = float(np.mean(np.std(residual_cell, axis=0)))
+
+            n_assignments = tenx_assignments.loc[
+                tenx_assignments[label_col] == src, "assignment"
+            ].nunique()
+            max_entropy = np.log2(max(n_assignments, 2))
+            norm_entropy = float(row["entropy"] / max_entropy) if max_entropy > 1e-12 else 0.0
+
+            ranking_rows.append(
+                {
+                    label_col: src,
+                    "subclass": row["subclass"],
+                    "top_assignment": top_assign,
+                    "n_cells": int(row["n_cells"]),
+                    "mean_conf": float(row["mean_conf"]),
+                    "top_frac": float(row["top_frac"]),
+                    "entropy": float(row["entropy"]),
+                    "normalized_entropy": norm_entropy,
+                    "profile_r": profile_r,
+                    "profile_r2": profile_r ** 2,
+                    "residual_rms": residual_rms,
+                    "residual_spread": residual_spread,
+                    **{f"spread_{g}": float(v) for g, v in zip(genes, np.std(residual_cell, axis=0))},
+                }
+            )
+
+    ranking_df = pd.DataFrame(ranking_rows)
+    if not ranking_df.empty:
+        def _zscore_series(series: pd.Series, invert: bool = False) -> pd.Series:
+            values = series.astype(float)
+            std = values.std(ddof=0)
+            if std < 1e-12:
+                z = pd.Series(np.zeros(len(values)), index=values.index)
+            else:
+                z = (values - values.mean()) / std
+            return -z if invert else z
+
+        ranking_df["overall_score"] = (
+            _zscore_series(ranking_df["mean_conf"])
+            + _zscore_series(ranking_df["profile_r"])
+            + _zscore_series(ranking_df["top_frac"])
+            + _zscore_series(ranking_df["normalized_entropy"], invert=True)
+            + _zscore_series(ranking_df["residual_spread"], invert=True)
+        )
+        ranking_df = ranking_df.sort_values(
+            ["overall_score", "profile_r", "mean_conf"],
+            ascending=[False, False, False],
+        ).reset_index(drop=True)
+        ranking_df["rank"] = np.arange(1, len(ranking_df) + 1)
+        ranking_df.to_csv(out_dir / "tenx_supertype_ranking.csv", index=False)
+
+    # ------------------------------------------------------------------ #
+    # Figure
+    # ------------------------------------------------------------------ #
+    fig = plt.figure(figsize=(22, max(10, 0.35 * max(len(row_labels), 20))))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.1, 1.6, 1.0], wspace=0.45)
+
+    # --- Panel A: confidence vs entropy scatter ---
+    ax_a = fig.add_subplot(gs[0])
+    for sub in subclass_order:
+        sub_df = stats_df[stats_df["subclass"] == sub]
+        if sub_df.empty:
+            continue
+        ax_a.scatter(
+            sub_df["mean_conf"], sub_df["entropy"],
+            s=sub_df["n_cells"].clip(upper=1000) * 0.05 + 15,
+            color=subclass_colors[sub], label=sub, alpha=0.75, edgecolors="none",
+        )
+    ax_a.set_xlabel("Mean Pearson r (match confidence)", fontsize=9)
+    ax_a.set_ylabel("Assignment entropy (fragmentation)", fontsize=9)
+    ax_a.set_title("A: Confidence vs Fragmentation", fontsize=10, fontweight="bold")
+    ax_a.legend(title="Subclass", fontsize=7, title_fontsize=8,
+                loc="upper left", markerscale=1.2)
+    ax_a.axvline(0.3, color="red", linestyle="--", lw=0.8, alpha=0.6)
+    ax_a.grid(alpha=0.3)
+
+    # Annotate the worst 5 points
+    worst5 = stats_df.nsmallest(5, "mean_conf")
+    for _, row in worst5.iterrows():
+        ax_a.annotate(
+            str(row[label_col]),
+            (row["mean_conf"], row["entropy"]),
+            fontsize=5, ha="left", va="bottom", alpha=0.8,
+        )
+
+    # --- Panel B: gene residual heatmap (worst supertypes) ---
+    ax_b = fig.add_subplot(gs[1])
+    vmax = np.abs(resid_matrix).max() if resid_matrix.size > 0 else 1.0
+    vmax = max(vmax, 0.1)
+    im = ax_b.imshow(
+        resid_matrix, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+    )
+    ax_b.set_xticks(range(len(col_labels)))
+    ax_b.set_xticklabels(col_labels, rotation=90, fontsize=7)
+    ax_b.set_yticks(range(len(row_labels)))
+    ax_b.set_yticklabels(row_labels, fontsize=6)
+    ax_b.set_title(
+        f"B: Gene residuals for {n_worst} lowest-confidence supertypes\n"
+        "(10x mean z − matched Tasic centroid z)",
+        fontsize=9, fontweight="bold",
+    )
+    plt.colorbar(im, ax=ax_b, label="Δz-score", shrink=0.6)
+    # Color y tick labels by subclass
+    if not resid_df.empty:
+        for tick, (_, row) in zip(ax_b.get_yticklabels(), worst_n.iterrows()):
+            tick.set_color(subclass_colors.get(row["subclass"], "#333333"))
+
+    # --- Panel C: confidence CDF per subclass ---
+    ax_c = fig.add_subplot(gs[2])
+    for sub in subclass_order:
+        sub_cells = tenx_assignments[
+            tenx_assignments[label_col].apply(_infer_sub) == sub
+        ]["confidence"].values
+        if len(sub_cells) == 0:
+            continue
+        sorted_conf = np.sort(sub_cells)
+        cdf = np.arange(1, len(sorted_conf) + 1) / len(sorted_conf)
+        ax_c.plot(sorted_conf, cdf, color=subclass_colors[sub], label=sub, lw=1.2)
+    ax_c.axvline(0.3, color="red", linestyle="--", lw=0.8, alpha=0.6, label="r=0.3")
+    ax_c.set_xlabel("Pearson r", fontsize=9)
+    ax_c.set_ylabel("CDF", fontsize=9)
+    ax_c.set_title("C: Confidence CDF by subclass", fontsize=10, fontweight="bold")
+    ax_c.legend(fontsize=7, title="Subclass", title_fontsize=8)
+    ax_c.grid(alpha=0.3)
+
+    plt.suptitle(
+        "10x-HMB → Tasic matching quality diagnostics",
+        fontsize=12, fontweight="bold", y=1.01,
+    )
+    plt.tight_layout()
+    fig.savefig(out_dir / "tenx_matching_quality_diagnostics.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: tenx_matching_quality_diagnostics.png")
+
+    # Best / worst cluster profiles
+    _plot_tenx_best_worst_clusters(
+        stats_df=stats_df,
+        tenx_assignments=tenx_assignments,
+        cell_df=cell_df,
+        tasic_centroids=tasic_centroids,
+        genes=genes,
+        label_col=label_col,
+        subclass_colors=subclass_colors,
+        out_dir=out_dir,
+    )
+
+    _plot_tenx_supertype_ranking(
+        ranking_df=ranking_df,
+        genes=genes,
+        subclass_order=subclass_order,
+        subclass_colors=subclass_colors,
+        label_col=label_col,
+        out_dir=out_dir,
+    )
+
+
+def _plot_tenx_best_worst_clusters(
+    stats_df: pd.DataFrame,
+    tenx_assignments: pd.DataFrame,
+    cell_df: pd.DataFrame,
+    tasic_centroids: pd.DataFrame,
+    genes: list[str],
+    label_col: str,
+    subclass_colors: dict,
+    out_dir: Path,
+    n_show: int = 3,
+) -> None:
+    """
+    2×n_show grid comparing the best and worst matched 10x supertypes.
+
+    Best  = highest concentration (top_frac * mean_conf): one dominant Tasic cluster.
+    Worst = highest entropy / lowest confidence: spread across many clusters.
+
+    Each column is one supertype.  Two sub-rows per supertype:
+      Upper: mean z-score bars (10x) + matched centroid line + 2nd-best dashed.
+      Lower: signed residual bars (mean − matched centroid), gene by gene.
+    """
+    if stats_df.empty or tasic_centroids is None or tasic_centroids.empty:
+        print("  Skipping best/worst cluster profiles (no centroid data).")
+        return
+
+    df = stats_df.copy()
+    df["best_score"] = df["top_frac"] * df["mean_conf"]
+    df["worst_score"] = df["entropy"] / (df["mean_conf"] + 0.01)
+
+    # Keep only supertypes whose cells are actually present in cell_df.
+    def _has_cells(lbl):
+        ids = tenx_assignments.loc[tenx_assignments[label_col] == lbl, "cell_id"].values
+        return any(c in cell_df.index for c in ids)
+
+    valid = df[df[label_col].apply(_has_cells)]
+    if len(valid) < 2:
+        print("  Skipping best/worst cluster profiles (too few valid supertypes).")
+        return
+
+    best_rows = valid.nlargest(n_show, "best_score").reset_index(drop=True)
+    worst_rows = valid.nlargest(n_show, "worst_score").reset_index(drop=True)
+
+    n_genes = len(genes)
+    x = np.arange(n_genes)
+
+    fig, axes = plt.subplots(
+        4, n_show,
+        figsize=(5.5 * n_show, 13),
+        gridspec_kw={"height_ratios": [2.5, 0.9, 2.5, 0.9], "hspace": 0.08, "wspace": 0.35},
+    )
+    if n_show == 1:
+        axes = axes.reshape(4, 1)
+
+    def _row_corr(v1, v2):
+        s1, s2 = v1.std(), v2.std()
+        v1n = (v1 - v1.mean()) / (s1 if s1 > 1e-9 else 1.0)
+        v2n = (v2 - v2.mean()) / (s2 if s2 > 1e-9 else 1.0)
+        return float(np.dot(v1n, v2n) / n_genes)
+
+    def _draw_col(ax_expr, ax_resid, row, tier_label, col_idx):
+        lbl = row[label_col]
+        top_assign = str(row["top_assignment"])
+        sub = str(row.get("subclass", "Other"))
+        color = subclass_colors.get(sub, "#555555")
+
+        # Mean expression for this supertype
+        cell_ids = tenx_assignments.loc[
+            tenx_assignments[label_col] == lbl, "cell_id"
+        ].values
+        present = [c for c in cell_ids if c in cell_df.index]
+        mean_expr = cell_df.loc[present, genes].mean().values
+
+        # Primary centroid (top assignment)
+        c1 = tasic_centroids.loc[top_assign, genes].values \
+            if top_assign in tasic_centroids.index else np.zeros(n_genes)
+
+        # 2nd-best centroid: highest Pearson r with supertype mean, excluding top
+        corrs = {
+            lbl_c: _row_corr(mean_expr, tasic_centroids.loc[lbl_c, genes].values)
+            for lbl_c in tasic_centroids.index
+        }
+        sorted_centroids = sorted(corrs, key=corrs.get, reverse=True)
+        second_assign = next(
+            (k for k in sorted_centroids if k != top_assign), top_assign
+        )
+        c2 = tasic_centroids.loc[second_assign, genes].values \
+            if second_assign in tasic_centroids.index else c1
+
+        residual = mean_expr - c1
+        r1 = corrs.get(top_assign, float("nan"))
+        r2 = corrs.get(second_assign, float("nan"))
+
+        # --- Upper panel: expression + centroids ---
+        ax_expr.bar(x, mean_expr, width=0.55, color=color, alpha=0.65,
+                    label=f"10x mean (n={len(present)})", zorder=2)
+        ax_expr.plot(x, c1, "o-", color="black", lw=1.8, ms=4,
+                     label=f"▶ {top_assign[:28]}\n   r={r1:.2f}", zorder=3)
+        ax_expr.plot(x, c2, "s--", color="#888888", lw=1.2, ms=3, alpha=0.85,
+                     label=f"2nd: {second_assign[:26]}\n    r={r2:.2f}", zorder=3)
+        ax_expr.axhline(0, color="grey", lw=0.5)
+        ax_expr.set_xticks([])
+        ax_expr.set_ylabel("z-score", fontsize=7.5)
+        entropy = row.get("entropy", float("nan"))
+        mean_conf = row.get("mean_conf", float("nan"))
+        ax_expr.set_title(
+            f"{tier_label} #{col_idx + 1}  [{sub}]\n"
+            f"{lbl}\n"
+            f"r={mean_conf:.2f}  H={entropy:.2f}",
+            fontsize=7.5, fontweight="bold",
+        )
+        ax_expr.legend(fontsize=5.5, loc="upper right", framealpha=0.7,
+                       handlelength=1.2)
+        ax_expr.grid(axis="y", alpha=0.25)
+
+        # --- Lower panel: residuals ---
+        resid_colors = ["#d73027" if v > 0 else "#4575b4" for v in residual]
+        ax_resid.bar(x, residual, width=0.55, color=resid_colors, alpha=0.85)
+        ax_resid.axhline(0, color="black", lw=0.7)
+        ax_resid.set_xticks(x)
+        ax_resid.set_xticklabels(genes, rotation=90, fontsize=6.5)
+        ax_resid.set_ylabel("Δz", fontsize=7)
+        ax_resid.tick_params(axis="y", labelsize=6)
+        ax_resid.grid(axis="y", alpha=0.2)
+
+    for ci, row in best_rows.iterrows():
+        _draw_col(axes[0, ci], axes[1, ci], row, "BEST", ci)
+
+    for ci, row in worst_rows.iterrows():
+        _draw_col(axes[2, ci], axes[3, ci], row, "WORST", ci)
+
+    # Horizontal divider between best and worst sections
+    fig.add_artist(plt.Line2D(
+        [0.02, 0.98], [0.505, 0.505],
+        transform=fig.transFigure,
+        color="#333333", lw=1.5, linestyle="--",
+    ))
+    fig.text(0.01, 0.75, "Best matched", va="center", rotation=90,
+             fontsize=9, fontweight="bold", color="#1a6b1a")
+    fig.text(0.01, 0.25, "Worst matched", va="center", rotation=90,
+             fontsize=9, fontweight="bold", color="#b30000")
+
+    plt.suptitle(
+        "10x-HMB: Best vs worst matched supertypes\n"
+        "(mean supertype z-score  |  matched Tasic centroid  |  residuals)",
+        fontsize=11, fontweight="bold", y=1.01,
+    )
+    plt.tight_layout()
+    fig.savefig(out_dir / "tenx_best_worst_cluster_profiles.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: tenx_best_worst_cluster_profiles.png")
+
+
+def _plot_tenx_supertype_ranking(
+    ranking_df: pd.DataFrame,
+    genes: list[str],
+    subclass_order: list[str],
+    subclass_colors: dict,
+    label_col: str,
+    out_dir: Path,
+) -> None:
+    """Save a full best-to-worst ordering of 10x supertypes with residual spread."""
+    if ranking_df.empty:
+        print("  Skipping full supertype ranking (no ranking data).")
+        return
+
+    n_rows = len(ranking_df)
+    height = max(9, 0.24 * n_rows)
+    fig = plt.figure(figsize=(18, height))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.25, 1.75], wspace=0.08)
+
+    ax_left = fig.add_subplot(gs[0])
+    y = np.arange(n_rows)
+    colors = [subclass_colors.get(sub, "#333333") for sub in ranking_df["subclass"]]
+    sizes = 18 + 90 * np.sqrt(ranking_df["n_cells"].clip(lower=1) / ranking_df["n_cells"].max())
+
+    ax_left.hlines(y=y, xmin=0, xmax=ranking_df["overall_score"], color=colors, alpha=0.35, linewidth=1.1)
+    ax_left.scatter(
+        ranking_df["overall_score"],
+        y,
+        s=sizes,
+        c=colors,
+        edgecolors="black",
+        linewidths=0.35,
+        zorder=3,
+    )
+    ax_left.axvline(0, color="#666666", linestyle="--", lw=0.8)
+    ax_left.set_yticks(y)
+    ax_left.set_yticklabels(ranking_df[label_col], fontsize=6.5)
+    ax_left.invert_yaxis()
+    ax_left.set_xlabel("Overall match score", fontsize=9)
+    ax_left.set_title(
+        "A: Full ordering of supertypes\n"
+        "score = fit + specificity - entropy - residual spread",
+        fontsize=10,
+        fontweight="bold",
+    )
+    ax_left.grid(axis="x", alpha=0.25)
+
+    ax_right = fig.add_subplot(gs[1])
+    spread_cols = [f"spread_{g}" for g in genes if f"spread_{g}" in ranking_df.columns]
+    spread_matrix = ranking_df[spread_cols].values if spread_cols else np.zeros((n_rows, len(genes)))
+    vmax = max(float(np.nanmax(spread_matrix)) if spread_matrix.size else 0.0, 0.1)
+    im = ax_right.imshow(spread_matrix, aspect="auto", cmap="magma", vmin=0, vmax=vmax)
+    ax_right.set_yticks(y)
+    ax_right.set_yticklabels([])
+    ax_right.set_xticks(range(len(genes)))
+    ax_right.set_xticklabels(genes, rotation=90, fontsize=7)
+    ax_right.set_title(
+        "B: Residual spread by gene\n"
+        "mean per-gene SD of (cell z - assigned centroid z)",
+        fontsize=10,
+        fontweight="bold",
+    )
+    plt.colorbar(im, ax=ax_right, label="Residual spread", shrink=0.6)
+
+    for tick, (_, row) in zip(ax_left.get_yticklabels(), ranking_df.iterrows()):
+        tick.set_color(subclass_colors.get(row["subclass"], "#333333"))
+
+    for ax in [ax_left, ax_right]:
+        boundaries = []
+        current = 0
+        for sub in subclass_order:
+            sub_n = int((ranking_df["subclass"] == sub).sum())
+            if sub_n > 0:
+                current += sub_n
+                if current < n_rows:
+                    boundaries.append(current - 0.5)
+        for boundary in boundaries:
+            ax.axhline(boundary, color="white", lw=1.0, alpha=0.9)
+
+    top5 = ranking_df.head(5)
+    bottom5 = ranking_df.tail(5)
+    left_notes = []
+    for _, row in top5.iterrows():
+        left_notes.append(
+            f"{int(row['rank'])}. {row[label_col]} | r={row['profile_r']:.2f} | spread={row['residual_spread']:.2f}"
+        )
+    right_notes = []
+    for _, row in bottom5.iterrows():
+        right_notes.append(
+            f"{int(row['rank'])}. {row[label_col]} | r={row['profile_r']:.2f} | spread={row['residual_spread']:.2f}"
+        )
+
+    fig.text(0.11, 0.012, "Best 5: " + "   ".join(left_notes), fontsize=7)
+    fig.text(0.11, 0.001, "Worst 5: " + "   ".join(right_notes), fontsize=7)
+    plt.suptitle(
+        "10x-HMB supertype ranking: best to worst matched",
+        fontsize=12,
+        fontweight="bold",
+        y=0.995,
+    )
+    plt.tight_layout(rect=[0, 0.03, 1, 0.985])
+    fig.savefig(out_dir / "tenx_supertype_ranking.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: tenx_supertype_ranking.png")
 
 
 def plot_stage5_diagnostics(
@@ -3342,6 +4524,11 @@ def main(
     drop_minor_subclasses: bool = False,
     min_cells_per_cluster: int = 0,
     min_cells_per_branch_cluster: int = 0,
+    run_10x_hmb: bool = False,
+    tenx_dir: Path = TENX_HMB_DIR,
+    tenx_expression_scale: str = "log2",
+    tenx_label_column: str = "supertype",
+    recompute_stage4: bool = False,
 ) -> None:
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     setup_logging(OUT_ROOT)
@@ -3351,6 +4538,12 @@ def main(
     print(f"  Drop minor subclasses: {drop_minor_subclasses}")
     print(f"  Min cells per cluster (Stage 1): {min_cells_per_cluster}")
     print(f"  Min cells per branch cluster (Stage 4): {min_cells_per_branch_cluster}")
+    print(f"  Run 10x-HMB matching: {run_10x_hmb}")
+    if run_10x_hmb:
+        print(f"  10x-HMB dir: {tenx_dir}")
+        print(f"  10x-HMB scale: {tenx_expression_scale}")
+        print(f"  10x-HMB label column: {tenx_label_column}")
+    print(f"  Recompute Stage 4: {recompute_stage4}")
 
     # Create stage-specific subdirectories
     normalization_dir = OUT_ROOT / "normalization"
@@ -3358,75 +4551,184 @@ def main(
     normalization_dir.mkdir(parents=True, exist_ok=True)
     batch_correction_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stage 1
-    tasic_z, hcr_z, tasic_log, hcr_log = run_stage1(
-        drop_minor_subclasses=drop_minor_subclasses,
-        min_cells_per_cluster=min_cells_per_cluster,
-    )
+    has_hcr_query = len(MOUSE_IDS) > 0
+    if (not has_hcr_query) and (not run_10x_hmb):
+        raise ValueError(
+            "MOUSE_IDS is empty and --run-10x-hmb is False. "
+            "Enable --run-10x-hmb to run 10x-only mode, or provide at least one mouse id."
+        )
 
-    # Stage 1 summary plots
-    plot_normalization_summary(tasic_z, hcr_z, normalization_dir)
+    tenx_raw_cached = None
+    tenx_z_cached = None
 
-    # Stage 2
-    hcr_corrected = run_stage2(hcr_z, hcr_log, tasic_z, batch_correction_dir, batch_mode=batch_mode)
+    if has_hcr_query:
+        # Stage 1
+        tasic_z, hcr_z, tasic_log, hcr_log = run_stage1(
+            drop_minor_subclasses=drop_minor_subclasses,
+            min_cells_per_cluster=min_cells_per_cluster,
+        )
 
-    # Save processed data for downstream stages
-    print("\n  Saving processed AnnData objects...")
-    tasic_z.write(OUT_ROOT / "tasic_z.h5ad")
-    hcr_corrected.write(OUT_ROOT / "hcr_corrected.h5ad")
-    hcr_log.write(OUT_ROOT / "hcr_log.h5ad")
-    tasic_log.write(OUT_ROOT / "tasic_log.h5ad")
+        # Stage 1 summary plots
+        plot_normalization_summary(tasic_z, hcr_z, normalization_dir)
 
-    # Save a summary table
-    summary = pd.DataFrame({
-        "item": [
-            "n_mice", "n_hcr_cells", "n_tasic_cells",
-            "n_shared_genes", "shared_genes", "batch_mode",
-        ],
-        "value": [
-            str(len(MOUSE_IDS)),
-            str(hcr_corrected.n_obs),
-            str(tasic_z.n_obs),
-            str(tasic_z.n_vars),
-            ", ".join(tasic_z.var_names.tolist()),
-            batch_mode,
-        ],
-    })
-    summary.to_csv(OUT_ROOT / "stage1_2_summary.csv", index=False)
+        # Stage 2
+        hcr_corrected = run_stage2(hcr_z, hcr_log, tasic_z, batch_correction_dir, batch_mode=batch_mode)
 
-    print("\n" + "=" * 60)
-    print("STAGES 1-2 COMPLETE")
-    print("=" * 60)
-    print(f"  Outputs: {OUT_ROOT}")
-    print(f"  Mice: {MOUSE_IDS}")
-    print(f"  HCR cells: {hcr_corrected.n_obs}")
-    print(f"  Tasic cells: {tasic_z.n_obs}")
-    print(f"  Panel genes: {tasic_z.n_vars} ({', '.join(tasic_z.var_names.tolist())})")
-    print(f"  Batch mode: {batch_mode}")
+        # Save processed data for downstream stages
+        print("\n  Saving processed AnnData objects...")
+        tasic_z.write(OUT_ROOT / "tasic_z.h5ad")
+        hcr_corrected.write(OUT_ROOT / "hcr_corrected.h5ad")
+        hcr_log.write(OUT_ROOT / "hcr_log.h5ad")
+        tasic_log.write(OUT_ROOT / "tasic_log.h5ad")
+
+        # Save a summary table
+        summary = pd.DataFrame({
+            "item": [
+                "n_mice", "n_hcr_cells", "n_tasic_cells",
+                "n_shared_genes", "shared_genes", "batch_mode",
+            ],
+            "value": [
+                str(len(MOUSE_IDS)),
+                str(hcr_corrected.n_obs),
+                str(tasic_z.n_obs),
+                str(tasic_z.n_vars),
+                ", ".join(tasic_z.var_names.tolist()),
+                batch_mode,
+            ],
+        })
+        summary.to_csv(OUT_ROOT / "stage1_2_summary.csv", index=False)
+
+        print("\n" + "=" * 60)
+        print("STAGES 1-2 COMPLETE")
+        print("=" * 60)
+        print(f"  Outputs: {OUT_ROOT}")
+        print(f"  Mice: {MOUSE_IDS}")
+        print(f"  HCR cells: {hcr_corrected.n_obs}")
+        print(f"  Tasic cells: {tasic_z.n_obs}")
+        print(f"  Panel genes: {tasic_z.n_vars} ({', '.join(tasic_z.var_names.tolist())})")
+        print(f"  Batch mode: {batch_mode}")
+    else:
+        print("\n" + "=" * 60)
+        print("10X-ONLY MODE: Building Tasic reference without HCR")
+        print("=" * 60)
+
+        # Load 10x first so we can use its genes to subset Tasic.
+        tenx_raw_cached = load_10x_hmb_query(tenx_dir=tenx_dir, label_column=tenx_label_column)
+        tenx_genes = [g for g in tenx_raw_cached.var_names if g not in EXCLUDE_GENES]
+
+        print("\n[1x.1] Loading Tasic reference (genes from 10x panel)...")
+        tasic_raw = load_tasic_inhibitory(genes=tenx_genes, layer="exon")
+
+        if drop_minor_subclasses or min_cells_per_cluster > 0:
+            print("\n[1x.1b] Filtering Tasic reference...")
+            tasic_raw = filter_tasic_reference(
+                tasic_raw,
+                drop_minor_subclasses=drop_minor_subclasses,
+                min_cells_per_cluster=min_cells_per_cluster,
+            )
+
+        print("\n[1x.2] Intersecting Tasic with 10x genes...")
+        tasic_raw, tenx_raw_cached = intersect_genes(tasic_raw, tenx_raw_cached, exclude=EXCLUDE_GENES)
+
+        print("\n[1x.3] Normalizing and z-scoring Tasic + 10x...")
+        tasic_log = normalize_tasic(tasic_raw)
+        tasic_z = zscore_genes(tasic_log)
+        tenx_log = normalize_10x_hmb(tenx_raw_cached, expression_scale=tenx_expression_scale)
+        tenx_z_cached = zscore_genes(tenx_log)
+
+        tasic_z.write(OUT_ROOT / "tasic_z.h5ad")
+        tasic_log.write(OUT_ROOT / "tasic_log.h5ad")
+        tenx_z_cached.write(OUT_ROOT / "10x_hmb_z.h5ad")
+
+        print(f"  Tasic cells: {tasic_z.n_obs}")
+        print(f"  10x cells:   {tenx_z_cached.n_obs}")
+        print(f"  Shared genes: {tasic_z.n_vars}")
 
     # Stage 3
     mapping, centroids_collapsed, separability_df = run_stage3(
         tasic_z, OUT_ROOT, effect_size_threshold=effect_threshold
     )
 
-    # Stage 4
-    branch_results, tasic_gating, hcr_gating, branch_marker_names = run_stage4(
-        tasic_log, tasic_z, hcr_corrected, OUT_ROOT,
-        min_cells_per_branch_cluster=min_cells_per_branch_cluster,
-    )
+    # Stage 4 (reuse cache if available unless recompute is requested)
+    if not recompute_stage4:
+        try:
+            print("\n[4.cache] Attempting to load existing Stage 4 outputs...")
+            branch_results, tasic_gating, hcr_gating, branch_marker_names = load_stage4_cached(OUT_ROOT)
+            print(f"  Loaded cached Stage 4 from {OUT_ROOT / 'stage4'}")
+        except Exception as e:
+            print(f"  Stage 4 cache not usable ({e}); recomputing Stage 4...")
+            branch_results, tasic_gating, hcr_gating, branch_marker_names = run_stage4(
+                tasic_log, tasic_z, hcr_corrected if has_hcr_query else None, OUT_ROOT,
+                min_cells_per_branch_cluster=min_cells_per_branch_cluster,
+            )
+    else:
+        branch_results, tasic_gating, hcr_gating, branch_marker_names = run_stage4(
+            tasic_log, tasic_z, hcr_corrected if has_hcr_query else None, OUT_ROOT,
+            min_cells_per_branch_cluster=min_cells_per_branch_cluster,
+        )
 
-    # Stage 5
-    hcr_assignments_a, hcr_assignments_c = run_stage5(
-        hcr_corrected, tasic_z, centroids_collapsed,
-        branch_results, hcr_gating, branch_marker_names, OUT_ROOT
-    )
+    # Stage 5 (HCR-only)
+    hcr_assignments_a = None
+    hcr_assignments_c = None
+    if has_hcr_query:
+        hcr_assignments_a, hcr_assignments_c = run_stage5(
+            hcr_corrected, tasic_z, centroids_collapsed,
+            branch_results, hcr_gating, branch_marker_names, OUT_ROOT
+        )
+
+    # Optional: 10x-HMB -> Tasic matching
+    if run_10x_hmb:
+        print("\n" + "=" * 60)
+        print("EXTRA: 10x-HMB QUERY MATCHING")
+        print("=" * 60)
+
+        if tenx_z_cached is None:
+            print("\n[10x.1] Loading 10x-HMB query matrix...")
+            tenx_raw = load_10x_hmb_query(tenx_dir=tenx_dir, label_column=tenx_label_column)
+
+            print("\n[10x.2] Intersecting genes with Tasic panel...")
+            # Reuse intersect utility by putting Tasic first to preserve tasic-var conventions.
+            tasic_tmp, tenx_raw = intersect_genes(tasic_z, tenx_raw, exclude=EXCLUDE_GENES)
+            del tasic_tmp
+
+            print("\n[10x.3] Normalizing + z-scoring 10x-HMB...")
+            tenx_log = normalize_10x_hmb(tenx_raw, expression_scale=tenx_expression_scale)
+            tenx_z = zscore_genes(tenx_log)
+            tenx_z.write(OUT_ROOT / "10x_hmb_z.h5ad")
+        else:
+            tenx_z = tenx_z_cached
+            print("\n[10x.1-3] Reusing precomputed 10x z-scored query from 10x-only bootstrap path.")
+
+        print("\n[10x.4] Soft subclass gating for 10x-HMB...")
+        tenx_gating = soft_subclass_gating(
+            tenx_z,
+            tasic_z,
+            n_neighbors=15,
+            confidence_threshold=0.5,
+            margin_threshold=0.2,
+        )
+
+        print("\n[10x.5] Matching 10x-HMB -> Tasic-derived clusters...")
+        run_stage5_10x_hmb(
+            tenx_z=tenx_z,
+            tasic_z=tasic_z,
+            centroids_collapsed=centroids_collapsed,
+            branch_results=branch_results,
+            tenx_gating=tenx_gating,
+            branch_marker_names=branch_marker_names,
+            out_dir=OUT_ROOT,
+            label_col=tenx_label_column,
+        )
 
     print("\n" + "=" * 60)
     print("ALL STAGES COMPLETE (1-5)")
     print("=" * 60)
-    print(f"  Approach A assignments: {len(hcr_assignments_a)}")
+    if hcr_assignments_a is not None:
+        print(f"  HCR Approach A assignments: {len(hcr_assignments_a)}")
     if hcr_assignments_c is not None:
-        print(f"  Approach C assignments: {len(hcr_assignments_c)}")
+        print(f"  HCR Approach C assignments: {len(hcr_assignments_c)}")
+    if run_10x_hmb:
+        print("  10x-HMB matching completed")
     print(f"  Outputs: {OUT_ROOT}")
 
 
@@ -3459,6 +4761,26 @@ if __name__ == "__main__":
              "clusters with fewer than N Tasic cells. Prevents rare/noisy "
              "clusters from entering the matching reference (default: 10).",
     )
+    parser.add_argument(
+        "--run-10x-hmb", action="store_true", default=False,
+        help="Also run 10x-HMB query matching into Tasic-derived clusters.",
+    )
+    parser.add_argument(
+        "--tenx-dir", type=Path, default=TENX_HMB_DIR,
+        help="Path to 10x-HMB folder containing cell_x_gene.csv and labels_supertype.csv.",
+    )
+    parser.add_argument(
+        "--tenx-expression-scale", type=str, default="log2", choices=["log2", "raw"],
+        help="Expression scale of input 10x-HMB matrix.",
+    )
+    parser.add_argument(
+        "--tenx-label-column", type=str, default="supertype",
+        help="Label column to use from labels_supertype.csv for mapping summaries.",
+    )
+    parser.add_argument(
+        "--recompute-stage4", action="store_true", default=False,
+        help="Force recomputation of Stage 4 even if cached outputs exist.",
+    )
     args = parser.parse_args()
     main(
         batch_mode=args.batch_mode,
@@ -3466,4 +4788,9 @@ if __name__ == "__main__":
         drop_minor_subclasses=args.drop_minor_subclasses,
         min_cells_per_cluster=args.min_cells_per_cluster,
         min_cells_per_branch_cluster=args.min_cells_per_branch_cluster,
+        run_10x_hmb=args.run_10x_hmb,
+        tenx_dir=args.tenx_dir,
+        tenx_expression_scale=args.tenx_expression_scale,
+        tenx_label_column=args.tenx_label_column,
+        recompute_stage4=args.recompute_stage4,
     )
