@@ -44,7 +44,7 @@ OUT_ROOT = Path("/root/capsule/results/hcr_tasic_matching")
 TENX_HMB_DIR = Path("/root/capsule/scratch/reference_atlas_cellxgene/10x-hmb")
 
 # Mice with confirmed pairwise-unmixed inhibitory cell data
-MOUSE_IDS = []#["790322", "788406"] # "782149"
+MOUSE_IDS = ["790322", "788406"] # "782149"
 
 # Genes to exclude from the shared panel (non-biological / control)
 EXCLUDE_GENES = {"GFP"}
@@ -511,9 +511,16 @@ def post_correction_qc(hcr_corrected: ad.AnnData, out_dir: Path) -> None:
         sc.pl.umap(adata, color="dominant_marker", ax=axes[1], show=False,
                    title="Post-correction: dominant marker")
 
+        # Marker panels show batch-corrected gene z-scores, so use a shared
+        # color scale across markers to make intensities comparable.
+        marker_absmax = float(np.nanmax(np.abs(marker_vals)))
+        marker_vmax = max(marker_absmax, 1.0)
+
         for i, gene in enumerate(marker_genes):
             sc.pl.umap(adata, color=gene, ax=axes[2 + i], show=False,
-                       title=f"Post-correction: {gene}", color_map="magma")
+                       title=f"Post-correction: {gene} (z-score)",
+                       color_map="RdBu_r", vmin=-marker_vmax, vmax=marker_vmax,
+                       vcenter=0)
 
     plt.tight_layout()
     fig.savefig(out_dir / "02_post_correction_umap.png", dpi=200, bbox_inches="tight")
