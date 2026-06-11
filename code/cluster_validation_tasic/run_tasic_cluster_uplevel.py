@@ -40,7 +40,7 @@ import cluster_validation_utils
 
 DATA_DIR = Path("/root/capsule/data")
 SS_PATH = Path("/root/capsule/scratch/mouse_VISp_gene_expression_matrices_2018-06-14")
-OUT_ROOT = Path("/root/capsule/results/hcr_tasic_matching")
+OUT_ROOT = Path("/root/capsule/scratch/hcr_tasic_matching")
 TENX_HMB_DIR = Path("/root/capsule/scratch/reference_atlas_cellxgene/10x-hmb")
 
 # Mice with confirmed pairwise-unmixed inhibitory cell data

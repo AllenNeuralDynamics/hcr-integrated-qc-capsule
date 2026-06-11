@@ -1912,4 +1912,183 @@ def top_discriminable_gene_pairs_per_cluster(
         pd.DataFrame(rows)[col_order]
         .sort_values(["cluster", "rank"])
         .reset_index(drop=True)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Confidence comparison: All cells vs Co-registered cells
+# ---------------------------------------------------------------------------
+
+def load_coreg_cell_ids(
+    mouse_id: "str | int",
+    data_dir: "Path | str",
+    catalog_path: "Path | str | None" = None,
+) -> set:
+    """
+    Load co-registered cell IDs for a mouse as a set of full cell IDs
+    formatted as ``"{mouse_id}_{hcr_id}"``, matching the ``cell_id`` column
+    produced by the HCR-Tasic matching pipeline.
+
+    Parameters
+    ----------
+    mouse_id : str or int
+    data_dir : path to the capsule data directory
+    catalog_path : path to the mouse JSON catalog file.
+        Defaults to ``/src/ophys-mfish-dataset-catalog/mice/{mouse_id}.json``.
+
+    Returns
+    -------
+    set[str]
+    """
+    import json
+    import pandas as pd
+
+    mouse_id = str(mouse_id)
+    data_dir = Path(data_dir)
+
+    if catalog_path is None:
+        catalog_path = Path(
+            f"/src/ophys-mfish-dataset-catalog/mice/{mouse_id}.json"
+        )
+
+    with open(catalog_path) as fh:
+        catalog = json.load(fh)
+
+    coreg_asset = catalog.get("derived_assets", {}).get("czstack_hcr_coreg")
+    if coreg_asset is None:
+        raise ValueError(f"No czstack_hcr_coreg asset found for mouse {mouse_id}")
+
+    coreg_csv = data_dir / coreg_asset / f"{mouse_id}_coreg_table.csv"
+    if not coreg_csv.exists():
+        raise FileNotFoundError(f"Coreg table not found: {coreg_csv}")
+
+    coreg_df = pd.read_csv(coreg_csv)
+    return {f"{mouse_id}_{hid}" for hid in coreg_df["hcr_id"].astype(str)}
+
+
+def plot_confidence_comparison(
+    assignments: "pd.DataFrame",
+    mouse_ids: "list[str]",
+    coreg_ids_by_mouse: dict,
+    branches: "list[str] | None" = None,
+    branch_colors: "dict[str, str] | None" = None,
+    metric: str = "confidence",
+    metric_label: str = "Matching confidence (Pearson r)",
+    figsize: "tuple[float, float] | None" = None,
+    ylim: "tuple[float, float] | None" = (0.0, 1.0),
+) -> "plt.Figure":
+    """
+    Grouped box plots comparing matching confidence (Pearson r to best
+    centroid) for *all* assigned cells versus *co-registered* cells only,
+    split by subclass, for one or more mice.
+
+    Each mouse gets its own panel.  Within each panel the x-axis shows the
+    subclass (branch) in the requested order, and the two hue groups are
+    ``"All cells"`` and ``"Co-reg cells"``.
+
+    Parameters
+    ----------
+    assignments : pd.DataFrame
+        Assignment table with columns ``cell_id``, ``branch``, ``confidence``,
+        ``mouse_id`` (as produced by Stage 5 of the HCR-Tasic pipeline).
+    mouse_ids : list[str]
+        One or more mouse IDs to plot (each gets its own panel).
+    coreg_ids_by_mouse : dict[str, set[str]]
+        Mapping from mouse_id (str) -> set of full cell IDs (e.g. "788406_1234")
+        that are co-registered.  Build with load_coreg_cell_ids().
+    branches : list[str], optional
+        Ordered subclass names for the x-axis.
+        Defaults to ["Vip", "Lamp5", "Sst", "Pvalb"].
+    branch_colors : dict[str, str], optional
+        Colour for each branch x-tick label.
+    metric : str
+        Column in assignments to plot on the y-axis.  Default "confidence".
+    metric_label : str
+        Y-axis label.
+    figsize : tuple[float, float], optional
+        Overall figure size.  Defaults to (5.5 * n_mice, 5).
+    ylim : tuple[float, float], optional
+        Y-axis limits.  Pass None to auto-scale.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import pandas as pd
+
+    if branches is None:
+        branches = ["Vip", "Lamp5", "Sst", "Pvalb"]
+
+    mouse_ids = [str(m) for m in mouse_ids]
+    n_mice = len(mouse_ids)
+
+    if figsize is None:
+        figsize = (5.5 * n_mice, 5)
+
+    palette = {"All cells": "#b0b0b0", "Co-reg cells": "#2196F3"}
+
+    fig, axes = plt.subplots(1, n_mice, figsize=figsize, sharey=True)
+    if n_mice == 1:
+        axes = [axes]
+
+    for ax, mouse_id in zip(axes, mouse_ids):
+        sub = assignments[assignments["mouse_id"].astype(str) == mouse_id].copy()
+        if sub.empty:
+            ax.set_title(f"Mouse {mouse_id}\n(no data)")
+            continue
+
+        coreg_ids = {str(c) for c in coreg_ids_by_mouse.get(mouse_id, [])}
+
+        # Build two slices: all cells and co-reg subset
+        all_df = sub[["branch", metric]].rename(columns={metric: "value"}).copy()
+        all_df["group"] = "All cells"
+
+        coreg_mask = sub["cell_id"].astype(str).isin(coreg_ids)
+        coreg_df = (
+            sub.loc[coreg_mask, ["branch", metric]]
+            .rename(columns={metric: "value"})
+            .copy()
+        )
+        coreg_df["group"] = "Co-reg cells"
+
+        plot_df = pd.concat([all_df, coreg_df], ignore_index=True)
+        plot_df["branch"] = pd.Categorical(
+            plot_df["branch"], categories=branches, ordered=True
+        )
+        plot_df = plot_df.dropna(subset=["branch"])
+
+        sns.boxplot(
+            data=plot_df,
+            x="branch",
+            y="value",
+            hue="group",
+            order=branches,
+            hue_order=["All cells", "Co-reg cells"],
+            palette=palette,
+            ax=ax,
+            linewidth=0.8,
+            flierprops=dict(marker=".", markersize=2, alpha=0.3),
+            width=0.6,
+        )
+
+        n_all = len(sub)
+        n_coreg = int(coreg_mask.sum())
+        ax.set_title(f"Mouse {mouse_id}\n({n_coreg:,} co-reg / {n_all:,} total)")
+        ax.set_xlabel("Subclass")
+        ax.set_ylabel(metric_label if ax is axes[0] else "")
+
+        if ylim is not None:
+            ax.set_ylim(ylim)
+
+        # Colour x-tick labels by branch
+        if branch_colors:
+            for tick in ax.get_xticklabels():
+                tick.set_color(branch_colors.get(tick.get_text(), "black"))
+
+        ax.legend(title="Cell set", fontsize=9, title_fontsize=9)
+
+    fig.suptitle(
+        "Matching confidence: All cells vs Co-registered cells", fontsize=12
     )
+    plt.tight_layout()
+    return fig
